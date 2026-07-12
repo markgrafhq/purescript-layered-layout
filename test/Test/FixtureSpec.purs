@@ -11,8 +11,8 @@ import Test.Spec.Assertions (shouldEqual)
 
 fixtureSpec :: Spec Unit
 fixtureSpec = describe "LayeredLayout fixture regressions" do
-  it "registers 23 corpus contracts including this guard" do
-    (Array.length allCases + 1) `shouldEqual` 23
+  it "owns all 22 shared graph fixtures" do
+    Array.length allCases `shouldEqual` 22
 
   for_ allCases \fixture ->
     it fixture.name do
