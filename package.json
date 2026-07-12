@@ -1,0 +1,7 @@
+{
+  "name": "purescript-layered-layout",
+  "scripts": {
+    "build": "spago build",
+    "test": "spago test"
+  }
+}
