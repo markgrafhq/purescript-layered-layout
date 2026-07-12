@@ -143,7 +143,7 @@ assignPorts edges placements portMap chains portOffsets = natural <#> applyTrunk
         ]
     let
       scored = candidates <#> \(from /\ to) ->
-        { from, to, score: spanAwareBends from to src tgt * 10 + sidePenalty from to }
+        { from, to, score: spanAwareBends from to src tgt * 10 + sidePenalty src tgt from to }
     case A.sortBy (\a b -> compare a.score b.score) scored # A.head of
       Just best -> { from: best.from, to: best.to }
       Nothing -> { from: South, to: North }
@@ -152,12 +152,12 @@ assignPorts edges placements portMap chains portOffsets = natural <#> applyTrunk
   -- mixed exits (East/West→North, South→East/West). ELK always routes
   -- inter-layer edges through top/bottom ports for cleaner VHV routing.
   -- Penalty must outweigh one bend difference (10 = one bend).
-  sidePenalty :: Side -> Side -> Int
-  sidePenalty South North = 0
-  sidePenalty North South = 0
-  sidePenalty East West = 5
-  sidePenalty West East = 5
-  sidePenalty _ _ = 15
+  sidePenalty :: NodePlacement -> NodePlacement -> Side -> Side -> Int
+  sidePenalty src tgt South North = if tgt.layer >= src.layer then 0 else 20
+  sidePenalty src tgt North South = if tgt.layer <= src.layer then 0 else 20
+  sidePenalty _ _ East West = 5
+  sidePenalty _ _ West East = 5
+  sidePenalty _ _ _ _ = 15
 
   -- Use span overlap to detect straight paths for opposing sides.
   -- autoPort picks the overlap center, so spans that overlap produce straight edges
