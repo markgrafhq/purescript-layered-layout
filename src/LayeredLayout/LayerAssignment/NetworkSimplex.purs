@@ -1,3 +1,8 @@
+-- Copyright (c) 2010, 2020 Kiel University and others.
+-- SPDX-License-Identifier: EPL-2.0
+-- Translated from ELK c831ba4613dfd6b0055851193956560351d2f907:
+-- NetworkSimplexLayerer.connectedComponentsDFS and initialize.
+--
 -- | Layer assignment via network simplex.
 -- |
 -- | The Gansner-Koutsofios-North-Vo core lives in `LayeredLayout.NetworkSimplex`
@@ -6,9 +11,7 @@
 -- |
 -- |   1. Partition the graph into weakly-connected components and run
 -- |      the simplex on each (`connectedComponents`).
--- |   2. Stack components vertically so component i sits below the
--- |      stack of components 0..i-1 (`stackVertically`).
--- |   3. After the optimal layering is normalised, run a balancing
+-- |   2. After each component's optimal layering is normalised, run a balancing
 -- |      pass that moves nodes whose in/out-degrees match to a
 -- |      less-populated layer when their feasible window allows it.
 module LayeredLayout.LayerAssignment.NetworkSimplex (networkSimplex) where
@@ -29,17 +32,12 @@ import LayeredLayout.NetworkSimplex (NEdge, runNetworkSimplex)
 -- | edges. Each edge has weight 1 and delta 1 (the minimum span).
 -- | The graph is split into weakly-connected components and the
 -- | simplex runs independently on each one so disconnected sub-graphs
--- | all receive a feasible layering. The per-component layers are
--- | then stacked vertically and a balancing pass moves nodes with
--- | matching in/out-degrees to less-populated layers where possible.
+-- | all receive a feasible layering starting at zero. Balancing uses only
+-- | the component's own layer filling, in its depth-first traversal order.
 networkSimplex :: Array NodeId -> Array { src :: NodeId, tgt :: NodeId } -> Map NodeId Int
 networkSimplex nodes rawEdges = do
   let components = connectedComponents nodes rawEdges
-  let perComponent = components <#> \cn -> runOnComponent cn rawEdges
-  let stacked = stackVertically perComponent
-  let merged = foldl M.union M.empty stacked
-  let allEdges = toNEdges rawEdges
-  balance nodes allEdges merged
+  foldl (\ranks cn -> M.union ranks (runOnComponent cn rawEdges)) M.empty components
 
 -- | Convert plain edges into the shared core's `NEdge` shape with
 -- | weight = 1.0 and delta = 1.
@@ -51,24 +49,16 @@ runOnComponent :: Array NodeId -> Array { src :: NodeId, tgt :: NodeId } -> Map 
 runOnComponent compNodes rawEdges = do
   let nodeSet = S.fromFoldable compNodes
   let edgesInComp = A.filter (\e -> S.member e.src nodeSet && S.member e.tgt nodeSet) rawEdges
-  runNetworkSimplex compNodes (toNEdges edgesInComp)
-
--- | Stack components vertically: offset each component's layers so
--- | component i starts after all previous components' layers. Component 0
--- | stays at 0..max, component 1 shifts to prevMax+1..prevMax+1+max, etc.
-stackVertically :: Array (Map NodeId Int) -> Array (Map NodeId Int)
-stackVertically comps = _.result $ foldl shiftOne { base: 0, result: [] } comps
-  where
-  shiftOne acc comp = do
-    let maxLayer = foldl max 0 (M.values comp)
-    let height = maxLayer + 1
-    let shifted = if acc.base == 0 then comp else map (_ + acc.base) comp
-    { base: acc.base + height, result: acc.result <> [ shifted ] }
+  let outgoing = foldl (\m e -> M.insertWith (<>) e.src [ e ] m) M.empty edgesInComp
+  -- ELK constructs NEdges in component-node order. In particular, incoming
+  -- edges at a target inherit that order for the feasible-tree traversal.
+  let edges = toNEdges (compNodes >>= \n -> fromMaybe [] (M.lookup n outgoing))
+  balance compNodes edges (runNetworkSimplex compNodes edges)
 
 -- | Port of `NetworkSimplexLayerer.connectedComponents`. Walks the
 -- | graph treating edges as undirected and partitions nodes into
--- | weakly-connected components, preserving the input order within
--- | each component.
+-- | weakly-connected components. Synthetic ports follow incident-edge input
+-- | order; visit each neighbour's subtree before the next incident edge.
 connectedComponents :: Array NodeId -> Array { src :: NodeId, tgt :: NodeId } -> Array (Array NodeId)
 connectedComponents nodes rawEdges = result.components
   where
@@ -87,18 +77,18 @@ connectedComponents nodes rawEdges = result.components
     | otherwise = do
         let comp = expand [ node ] st.visited []
         st
-          { visited = foldl (\s n -> S.insert n s) st.visited comp.nodes
+          { visited = comp.visited
           , components = st.components <> [ comp.nodes ]
           }
 
   expand stack visited acc = case A.uncons stack of
-    Nothing -> { nodes: acc }
+    Nothing -> { nodes: acc, visited }
     Just { head: n, tail: rest } ->
       if S.member n visited then expand rest visited acc
       else do
         let visited' = S.insert n visited
         let neighbours = fromMaybe [] (M.lookup n adj)
-        expand (rest <> neighbours) visited' (acc <> [ n ])
+        expand (neighbours <> rest) visited' (acc <> [ n ])
 
 -- | Port of `NetworkSimplex.balance`. After the optimal layering is
 -- | normalised, scan every node whose in-degree matches its out-degree

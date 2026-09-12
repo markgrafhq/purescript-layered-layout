@@ -9,6 +9,7 @@ module LayeredLayout.JavaRandom
   , mkRandom
   , mkRandomBI
   , next
+  , nextInt
   , nextDouble
   , nextLong
   , nextLongBI
@@ -21,6 +22,7 @@ import Prelude
 import Data.Array as A
 import Data.Foldable (foldl)
 import Data.Int as Int
+import Data.Int.Bits (and)
 import Data.Maybe (fromMaybe)
 import Data.Tuple.Nested (type (/\), (/\))
 import Data.Number (pow)
@@ -48,6 +50,17 @@ next bits (Random s) = do
   let shifted = BI.shr s' (BI.fromInt (48 - bits))
   let result = fromMaybe 0 (Int.fromNumber (BI.toNumber shifted))
   result /\ Random s'
+
+-- java.util.Random.nextInt(bound), including rejection rather than modulo bias.
+nextInt :: Int -> Random -> Int /\ Random
+nextInt bound random =
+  let
+    bits /\ random' = next 31 random
+    result = bits `mod` bound
+  in
+    if and bound (bound - 1) == 0 then Int.floor (Int.toNumber bound * Int.toNumber bits / 2147483648.0) /\ random'
+    else if Int.toNumber bits - Int.toNumber result + Int.toNumber (bound - 1) >= 2147483648.0 then nextInt bound random'
+    else result /\ random'
 
 -- | nextDouble() = ((next(26) << 27) | next(27)) / 2^53
 nextDouble :: Random -> Number /\ Random

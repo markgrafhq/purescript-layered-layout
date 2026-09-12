@@ -39,29 +39,21 @@ import Data.Map (Map)
 import Data.Map as M
 import Data.Maybe (Maybe(..), fromMaybe, isJust)
 import Data.Newtype (un)
-import Data.Tuple (fst, snd)
+import Data.Tuple (fst)
 import Data.Tuple.Nested (type (/\), (/\))
 import LayeredLayout.EdgeRouting.PortAssignment (PortAssignment, scaleFactor)
 import LayeredLayout.Graph (EdgeId(..), NodeId(..), PortId(..))
 import LayeredLayout.Result (NodePlacement)
+import LayeredLayout.EdgeRouting.HyperEdgeCycleDetector (Dep, DepKind(..), isCritical)
+import LayeredLayout.EdgeRouting.HyperEdgeCycleDetector as CycleDetector
+import LayeredLayout.JavaRandom (Random)
 
 type SlotInfo =
   { slot :: Int
   , slotCount :: Int
-  , gapTop :: Number
-  , gapBottom :: Number
+  , gap :: Int
   , partner :: Maybe { slot :: Int, splitX :: Number }
   }
-
-data DepKind = Regular | Critical
-
-derive instance Eq DepKind
-
-isCritical :: DepKind -> Boolean
-isCritical Critical = true
-isCritical Regular = false
-
-type Dep = { src :: Int, tgt :: Int, weight :: Int, kind :: DepKind }
 
 type Segment =
   { id :: Int
@@ -82,35 +74,20 @@ type ConflictResult = { conflicts :: Int, critical :: Boolean }
 -- | router will need in that gap. Straight pass-through segments
 -- | don't add a rank, but every segment with a horizontal trunk does.
 -- |
--- | We derive this from `assignSlots`' output by bucketing edges back to
--- | their gap (via the placement layers) and reading out the shared
--- | `slotCount` field.
-slotCountByGap :: Array PortAssignment -> Array NodePlacement -> Map Int Int
-slotCountByGap assignments placements =
-  foldl perEdge M.empty assignments
-  where
-  slots = assignSlots assignments placements
+-- | Read the channel counts from an existing plan. Gap sizing and routing
+-- share that plan rather than running the randomized cycle detector twice.
+slotCountByGap :: Map EdgeId SlotInfo -> Map Int Int
+slotCountByGap = foldl (\counts info -> M.insert info.gap info.slotCount counts) M.empty
 
-  placedByNode :: Map NodeId NodePlacement
-  placedByNode = foldl (\m p -> M.insert p.node p m) M.empty placements
-
-  layerOfNode :: NodeId -> Maybe Int
-  layerOfNode nid = M.lookup nid placedByNode <#> _.layer
-
-  gapIndex a = case layerOfNode a.edge.from.node /\ layerOfNode a.edge.to.node of
-    Just s /\ Just t | s /= t -> Just (min s t)
-    _ -> Nothing
-
-  perEdge acc a = case gapIndex a /\ M.lookup a.edge.id slots of
-    Just gi /\ Just info -> M.insert gi info.slotCount acc
-    _ -> acc
-
-assignSlots :: Array PortAssignment -> Array NodePlacement -> Map EdgeId SlotInfo
-assignSlots assignments placements =
-  foldl mergeGap M.empty grouped
+assignSlots :: Random -> Array PortAssignment -> Array NodePlacement -> { slots :: Map EdgeId SlotInfo, random :: Random }
+assignSlots random assignments placements =
+  foldl mergeGap { slots: M.empty, random } grouped
   where
   mergeGap acc (gap /\ assigns) =
-    foldl (\m (eid /\ info) -> M.insert eid info m) acc (slotsForGap gap assigns)
+    let
+      planned = slotsForGap acc.random gap assigns
+    in
+      { slots: M.union acc.slots (M.fromFoldable planned.slots), random: planned.random }
 
   layerOfNode :: NodeId -> Maybe Int
   layerOfNode nid = M.lookup nid placedByNode <#> _.layer
@@ -157,23 +134,22 @@ assignSlots assignments placements =
   -- 5 fine = 1.25 grid.
   conflictThreshold = 0.5 * 2.5 * Int.toNumber scaleFactor
 
-  slotsForGap :: Int -> Array PortAssignment -> Array (EdgeId /\ SlotInfo)
-  slotsForGap _ assigns = do
+  slotsForGap :: Random -> Int -> Array PortAssignment -> { slots :: Array (EdgeId /\ SlotInfo), random :: Random }
+  slotsForGap currentRandom gap assigns = do
     let segments0 = buildSegments assigns
-    if A.null segments0 then []
+    if A.null segments0 then { slots: [], random: currentRandom }
     else do
       let critThreshold = 0.2 * minimumHorizontalSegmentDistance segments0
       let withDeps = addDependencies critThreshold segments0
-      let postSplit = breakCriticalCycles critThreshold withDeps
-      let acyclic = breakNonCriticalCycles postSplit
-      let numbered = topologicalNumbering acyclic
+      let postSplit = breakCriticalCycles currentRandom critThreshold withDeps
+      let acyclic = breakNonCriticalCycles postSplit.random postSplit.graph
+      let numbered = topologicalNumbering acyclic.graph
       -- Port of `OrthogonalRoutingGenerator.routeEdges` return:
       -- `rankCount = max over segments of routingSlot`; the function
       -- returns `rankCount + 1`. Each segment's slot counts as a
       -- routing rank that needs its own y; straight pass-through
       -- segments don't contribute a rank.
-      let total = 1 + foldl (\m seg -> max m seg.slot) 0 numbered
-      let { gapTop, gapBottom } = gapBounds numbered
+      let total = 1 + foldl (\rank seg -> if isStraightSegment seg then rank else max rank seg.slot) (-1) numbered
       -- A long-edge segment that got split during critical-cycle
       -- breaking now has two halves in `numbered`: `halfA` (carries
       -- the original `incoming` and `splitBy = Just causing`) and
@@ -193,18 +169,19 @@ assignSlots assignments placements =
             _ -> false
           Nothing -> false
       let useful = A.filter (not <<< isTrailingHalf) numbered
-      A.concat
-        ( useful <#> \seg ->
-            seg.members <#> \eid -> do
-              let
-                partnerInfo = case seg.splitPartner of
-                  Just pid -> case M.lookup pid segById of
-                    Just p -> Just { slot: p.slot, splitX: fromMaybe 0.0 (A.head p.incoming) }
+      { slots: A.concat
+          ( useful <#> \seg ->
+              seg.members <#> \eid -> do
+                let
+                  partnerInfo = case seg.splitPartner of
+                    Just pid -> case M.lookup pid segById of
+                      Just p -> Just { slot: p.slot, splitX: fromMaybe 0.0 (A.head p.incoming) }
+                      Nothing -> Nothing
                     Nothing -> Nothing
-                  Nothing -> Nothing
-              eid /\
-                { slot: seg.slot, slotCount: total, gapTop, gapBottom, partner: partnerInfo }
-        )
+                eid /\ { slot: seg.slot, slotCount: total, gap, partner: partnerInfo }
+          )
+      , random: acyclic.random
+      }
 
   -- ── Step 1: hyperedge segments grouped by source port ────────────
 
@@ -357,18 +334,21 @@ assignSlots assignments placements =
   -- After splitting, the dep graph for the new segments is regenerated
   -- so the regular-cycle pass sees a consistent state.
   breakCriticalCycles
-    :: Number
+    :: Random
+    -> Number
     -> { segments :: Array Segment, deps :: Array Dep }
-    -> { segments :: Array Segment, deps :: Array Dep }
-  breakCriticalCycles critThreshold input = do
+    -> { graph :: { segments :: Array Segment, deps :: Array Dep }, random :: Random }
+  breakCriticalCycles currentRandom critThreshold input = do
     let critDeps = A.filter (\d -> isCritical d.kind) input.deps
-    if A.length critDeps < 2 then input
+    if A.length critDeps < 2 then { graph: input, random: currentRandom }
     else do
-      let marked = computeMarks input.segments critDeps
-      let markMap = M.fromFoldable (marked <#> \s -> s.id /\ s.mark)
-      let leftward = A.filter (\d -> markOf markMap d.src > markOf markMap d.tgt) critDeps
-      if A.null leftward then input
-      else splitSegments critThreshold leftward input
+      let detected = CycleDetector.detect true currentRandom (input.segments <#> _.id) critDeps
+      let
+        leftward = A.filter (\d -> markOf detected.marks d.src > markOf detected.marks d.tgt)
+          (A.sortBy (\a b -> compare a.src b.src) critDeps)
+      { graph: if A.null leftward then input else splitSegments critThreshold leftward input
+      , random: detected.random
+      }
 
   markOf :: Map Int Int -> Int -> Int
   markOf m k = fromMaybe 0 (M.lookup k m)
@@ -699,84 +679,24 @@ assignSlots assignments placements =
   -- never reversed (the splitter handled their cycles already), only
   -- preserved in their original direction.
   breakNonCriticalCycles
-    :: { segments :: Array Segment, deps :: Array Dep }
+    :: Random
     -> { segments :: Array Segment, deps :: Array Dep }
-  breakNonCriticalCycles input =
-    { segments: marked
-    , deps: A.mapMaybe rewrite input.deps
+    -> { graph :: { segments :: Array Segment, deps :: Array Dep }, random :: Random }
+  breakNonCriticalCycles currentRandom input =
+    { graph:
+        { segments: input.segments <#> \segment -> segment { mark = markOf detected.marks segment.id }
+        , deps: A.mapMaybe rewrite input.deps
+        }
+    , random: detected.random
     }
     where
-    marked = computeMarks input.segments input.deps
-    markMap = M.fromFoldable (marked <#> \s -> s.id /\ s.mark)
-
+    detected = CycleDetector.detect false currentRandom (input.segments <#> _.id) input.deps
     rewrite d
       | isCritical d.kind = Just d
-      | markOf markMap d.src > markOf markMap d.tgt =
+      | markOf detected.marks d.src > markOf detected.marks d.tgt =
           if d.weight == 0 then Nothing
-          else Just { src: d.tgt, tgt: d.src, weight: d.weight, kind: d.kind }
+          else Just (d { src = d.tgt, tgt = d.src })
       | otherwise = Just d
-
-  -- Linear-ordering marks via the Eades-Lin-Smyth feedback-arc heuristic.
-  computeMarks :: Array Segment -> Array Dep -> Array Segment
-  computeMarks segs deps = go initial
-    where
-    n = A.length segs
-    markBase = n
-    initial =
-      { remaining: segs <#> \s -> s.id
-      , marks: M.empty :: Map Int Int
-      , inWeight: foldl (\m d -> M.insertWith (+) d.tgt d.weight m) M.empty deps
-      , outWeight: foldl (\m d -> M.insertWith (+) d.src d.weight m) M.empty deps
-      , depsBySrc: foldl (\m d -> M.insertWith (<>) d.src [ d ] m) M.empty deps
-      , depsByTgt: foldl (\m d -> M.insertWith (<>) d.tgt [ d ] m) M.empty deps
-      , nextSink: markBase - 1
-      , nextSource: markBase + 1
-      }
-
-    weight m k = fromMaybe 0 (M.lookup k m)
-
-    go st = case drainSinks st of
-      st' -> case drainSources st' of
-        st'' ->
-          if A.null st''.remaining then finalize st''
-          else go (pickMaxOutflow st'')
-
-    drainSinks st = case A.find (\sid -> weight st.outWeight sid == 0) st.remaining of
-      Nothing -> st
-      Just sid ->
-        drainSinks (removeSegment sid st.nextSink (\s -> s { nextSink = s.nextSink - 1 }) st)
-
-    drainSources st = case A.find (\sid -> weight st.inWeight sid == 0) st.remaining of
-      Nothing -> st
-      Just sid ->
-        drainSources (removeSegment sid st.nextSource (\s -> s { nextSource = s.nextSource + 1 }) st)
-
-    pickMaxOutflow st = case A.head sorted of
-      Nothing -> st
-      Just sid ->
-        removeSegment sid st.nextSource (\s -> s { nextSource = s.nextSource + 1 }) st
-      where
-      sorted = A.sortBy
-        (\a b -> compare (outflow b) (outflow a))
-        st.remaining
-      outflow sid = weight st.outWeight sid - weight st.inWeight sid
-
-    removeSegment sid mark advance st = do
-      let outDeps = fromMaybe [] (M.lookup sid st.depsBySrc)
-      let inDeps = fromMaybe [] (M.lookup sid st.depsByTgt)
-      let inWeight' = foldl (\m d -> M.insertWith (+) d.tgt (-d.weight) m) st.inWeight outDeps
-      let outWeight' = foldl (\m d -> M.insertWith (+) d.src (-d.weight) m) st.outWeight inDeps
-      advance st
-        { remaining = A.filter (_ /= sid) st.remaining
-        , marks = M.insert sid mark st.marks
-        , inWeight = inWeight'
-        , outWeight = outWeight'
-        }
-
-    finalize st = segs <#> \seg -> do
-      let raw = fromMaybe seg.id (M.lookup seg.id st.marks)
-      let shifted = if raw < markBase then raw + n + 1 else raw
-      seg { mark = shifted }
 
   -- ── Step 4: topological numbering ───────────────────────────────
 
@@ -837,23 +757,22 @@ assignSlots assignments placements =
   insertSorted :: Number -> Array Number -> Array Number
   insertSorted v xs = A.takeWhile (_ < v) xs <> [ v ] <> A.dropWhile (_ <= v) xs
 
-  -- Port of `minimumHorizontalSegmentDistance`: minimum gap between
-  -- distinct sorted in/out coordinates across all segments. When fewer
-  -- than two distinct positions exist, fall back to the regular
-  -- conflict threshold so the critical threshold doesn't trigger
-  -- spuriously. Coordinates that differ by less than `epsilon` are
-  -- treated as duplicates: `gridX * sf` round-trips through divisions
-  -- accumulate ~1e-14 rounding, and ELK's exact-equality `distinct`
-  -- never sees the noise because its computation paths happen to land
-  -- on the same `Double`. Treating those near-duplicates as one keeps
-  -- `criticalConflictThreshold` realistic instead of collapsing to ~0.
+  -- Port of `minimumHorizontalSegmentDistance`: only adjacent incoming
+  -- connections and adjacent outgoing connections establish the critical
+  -- distance. Mixing both sides would let the conflicts being measured
+  -- shrink their own threshold and suppress necessary segment splits.
   minimumHorizontalSegmentDistance :: Array Segment -> Number
-  minimumHorizontalSegmentDistance segs = do
-    let raw = (segs >>= \s -> s.incoming) <> (segs >>= \s -> s.outgoing)
-    let sorted = nubNear epsilon (A.sort raw)
-    if A.length sorted < 2 then conflictThreshold
-    else (foldl scan { prev: Nothing, mn: 1.0e18 } sorted).mn
+  minimumHorizontalSegmentDistance segs =
+    min (minimumDifference (segs >>= _.incoming))
+      (minimumDifference (segs >>= _.outgoing))
     where
+    -- Preserve near-equal coordinate deduplication across grid round trips.
+    -- An unconstrained side (fewer than two positions) cannot lower the
+    -- other side's threshold; Java uses Double.MAX_VALUE for that case.
+    minimumDifference coordinates =
+      ( foldl scan { prev: Nothing, mn: 1.7976931348623157e308 }
+          (nubNear epsilon (A.sort coordinates))
+      ).mn
     epsilon = 1.0e-9
     scan acc x = case acc.prev of
       Nothing -> { prev: Just x, mn: acc.mn }
@@ -865,17 +784,6 @@ assignSlots assignments placements =
     step acc x = case acc.prev of
       Just p | x - p < eps -> acc
       _ -> { prev: Just x, out: acc.out <> [ x ] }
-
-  -- Bounds of the inter-layer gap.
-  gapBounds segs = do
-    let memberIds = A.concatMap _.members segs
-    let memberAssigns = A.filter (\a -> A.elem a.edge.id memberIds) assignments
-    let srcYs = memberAssigns <#> \a -> snd a.fromPos
-    let tgtYs = memberAssigns <#> \a -> snd a.toPos
-    let top = foldl max (-1.0e18) srcYs
-    let bot = foldl min 1.0e18 tgtYs
-    if top > bot then { gapTop: bot, gapBottom: top }
-    else { gapTop: top, gapBottom: bot }
 
 type FreeArea =
   { startPosition :: Number

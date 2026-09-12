@@ -73,6 +73,13 @@ type NodePlacement =
   , order :: Int
   }
 
+-- | Center edge-label geometry in fine/router-grid units.
+type EdgeLabelPlacement =
+  { edge :: EdgeId
+  , position :: GridPos
+  , size :: GridSize
+  }
+
 type Metrics =
   { crossingCount :: Int
   , bendCount :: Int
@@ -86,6 +93,7 @@ type Metrics =
 type LayoutResult =
   { nodes :: Array NodePlacement
   , edges :: Array EdgePath
+  , edgeLabels :: Array EdgeLabelPlacement
   , boundingBox :: GridRect
   , metrics :: Metrics
   }

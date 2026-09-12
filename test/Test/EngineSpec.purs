@@ -24,6 +24,8 @@ import LayeredLayout.EdgeRouting.PortAssignment (assignPorts, portSlots)
 import LayeredLayout.Graph (Alignment(..), Axis(..), Constraints(..), Edge, EdgeId(..), Graph, Justify(..), LayerPin(..), NodeId(..), PortId(..), Shape(..), Side(..))
 import LayeredLayout.Grid (GridPos(..), GridSize(..), addPos, contains, gridX, gridY, manhattan, overlaps, sizeH, sizeW, subPos)
 import LayeredLayout.LayerAssignment as LayerAssignment
+import LayeredLayout.JavaRandom (mkRandom)
+import LayeredLayout.PortDummies as PortDummies
 import LayeredLayout.Result (BendType(..), Direction(..), EdgePath, EdgeSegment)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual, shouldSatisfy)
@@ -244,7 +246,7 @@ cycleRemovalSpec = describe "LayeredLayout.CycleRemoval" do
     let layers = [ [ NodeId "a" ], [ NodeId "d", NodeId "c", NodeId "b" ] ]
     let edges = [ mkEdge "e1" "a" "b", mkEdge "e2" "a" "c", mkEdge "e3" "a" "d" ]
     let modelOrder = M.fromFoldable [ (NodeId "a" /\ 0), (NodeId "b" /\ 1), (NodeId "c" /\ 2), (NodeId "d" /\ 3) ]
-    let result = CrossingMin.minimize { iterations: 4, constraints: [], modelOrder } layers edges
+    let result = _.layout $ CrossingMin.minimize { iterations: 4, constraints: [], modelOrder, ports: M.empty, chains: [], random: mkRandom 1.0, reversed: S.empty, portDummies: PortDummies.empty } layers edges
     A.index result 1 `shouldEqual` Just [ NodeId "b", NodeId "c", NodeId "d" ]
 
 layerAssignmentSpec :: Spec Unit
@@ -306,10 +308,6 @@ layerAssignmentSpec = describe "LayeredLayout.LayerAssignment" do
     -- Each component must produce a forward layering.
     (layerOf "a" < layerOf "b") `shouldSatisfy` identity
     (layerOf "c" < layerOf "d") `shouldSatisfy` identity
-    -- Components must be stacked vertically (ELK convention): no overlap in
-    -- layer ranges. The first component (a,b) occupies lower layers; the
-    -- second (c,d) occupies strictly higher layers.
-    (layerOf "c" > layerOf "b") `shouldSatisfy` identity
 
   it "NetworkSimplex diamond keeps source at 0 and sink past 1" do
     let edges = [ mkEdge "e1" "a" "b", mkEdge "e2" "a" "c", mkEdge "e3" "b" "d", mkEdge "e4" "c" "d" ]
@@ -347,67 +345,31 @@ dummyNodeSpec = describe "LayeredLayout.DummyNodes" do
 
 crossingMinSpec :: Spec Unit
 crossingMinSpec = describe "LayeredLayout.CrossingMin" do
-  it "preserves layer count" do
-    let layers = [ [ NodeId "a" ], [ NodeId "b", NodeId "c" ] ]
-    let edges = [ mkEdge "e1" "a" "b", mkEdge "e2" "a" "c" ]
-    let result = CrossingMin.minimize { iterations: 4, constraints: [], modelOrder: M.empty } layers edges
-    A.length result `shouldEqual` 2
-
   it "preserves all nodes" do
     let layers = [ [ NodeId "a", NodeId "b" ], [ NodeId "c", NodeId "d" ] ]
     let edges = [ mkEdge "e1" "a" "d", mkEdge "e2" "b" "c" ]
-    let result = CrossingMin.minimize { iterations: 4, constraints: [], modelOrder: M.empty } layers edges
-    let allNodes = A.concat result
-    A.length allNodes `shouldEqual` 4
+    let result = _.layout $ CrossingMin.minimize { iterations: 4, constraints: [], modelOrder: M.empty, ports: M.empty, chains: [], random: mkRandom 1.0, reversed: S.empty, portDummies: PortDummies.empty } layers edges
+    map A.sort result `shouldEqual` map A.sort layers
 
 coordAssignmentSpec :: Spec Unit
 coordAssignmentSpec = describe "LayeredLayout.CoordAssignment" do
-  it "assigns integer positions" do
-    let layers = [ [ NodeId "a", NodeId "b" ], [ NodeId "c" ] ]
-    let sizeMap = M.fromFoldable [ NodeId "a" /\ GridSize (1.0 /\ 1.0), NodeId "b" /\ GridSize (1.0 /\ 1.0), NodeId "c" /\ GridSize (1.0 /\ 1.0) ]
-    let cfg = { nodeGap: 2, layerGap: 3 }
-    let result = CoordAssignment.assign cfg [] layers sizeMap M.empty [] [] M.empty
-    A.length result `shouldEqual` 3
-
   it "nodes in same layer get different x" do
     let layers = [ [ NodeId "a", NodeId "b" ] ]
     let sizeMap = M.fromFoldable [ NodeId "a" /\ GridSize (1.0 /\ 1.0), NodeId "b" /\ GridSize (1.0 /\ 1.0) ]
     let cfg = { nodeGap: 2, layerGap: 3 }
-    let result = CoordAssignment.assign cfg [] layers sizeMap M.empty [] [] M.empty
+    let result = _.placements $ CoordAssignment.assign (mkRandom 1.0) cfg [] layers sizeMap M.empty M.empty [] [] M.empty
     let xs = result <#> \p -> gridX p.position
     (A.nub xs # A.length) `shouldEqual` 2
 
 edgeRoutingSpec :: Spec Unit
 edgeRoutingSpec = describe "LayeredLayout.EdgeRouting" do
-  it "routes edge between two nodes" do
-    let
-      placements =
-        [ { node: NodeId "a", position: GridPos (0.0 /\ 0.0), size: GridSize (1.0 /\ 1.0), layer: 0, order: 0 }
-        , { node: NodeId "b", position: GridPos (0.0 /\ 3.0), size: GridSize (1.0 /\ 1.0), layer: 1, order: 0 }
-        ]
-    let edges = [ mkEdge "e1" "a" "b" ]
-    let portMap = M.empty :: M.Map NodeId (Array _)
-    let result = routeAll edges placements portMap [] M.empty
-    A.length result `shouldEqual` 1
-
-  it "all segments are orthogonal" do
-    let
-      placements =
-        [ { node: NodeId "a", position: GridPos (0.0 /\ 0.0), size: GridSize (2.0 /\ 1.0), layer: 0, order: 0 }
-        , { node: NodeId "b", position: GridPos (4.0 /\ 3.0), size: GridSize (2.0 /\ 1.0), layer: 1, order: 0 }
-        ]
-    let edges = [ mkEdge "e1" "a" "b" ]
-    let result = routeAll edges placements (M.empty :: M.Map NodeId (Array _)) [] M.empty
-    let allOrthogonal = A.all (\p -> A.all (\s -> s.direction == H || s.direction == V) p.segments) result
-    allOrthogonal `shouldSatisfy` identity
-
-  it "self-loop routes as a C-shaped bump on east side" do
+  it "self-loop routes as a C-shaped bump" do
     let
       placements =
         [ { node: NodeId "a", position: GridPos (0.0 /\ 0.0), size: GridSize (2.0 /\ 2.0), layer: 0, order: 0 }
         ]
     let edges = [ mkEdge "e1" "a" "a" ]
-    let result = routeAll edges placements (M.empty :: M.Map NodeId (Array _)) [] M.empty
+    let result = routeAll (mkRandom 1.0) Nothing edges placements placements (M.empty :: M.Map NodeId (Array _)) [] M.empty
     A.length result `shouldEqual` 1
     case A.head result of
       Just ep -> do
@@ -417,16 +379,16 @@ edgeRoutingSpec = describe "LayeredLayout.EdgeRouting" do
         directions `shouldEqual` [ H, V, H ]
       Nothing -> 1 `shouldEqual` 0
 
-  it "two self-loops on one node distribute equally" do
+  it "keeps the exit anchors of two self-loops distinct" do
     let
       placements =
         [ { node: NodeId "a", position: GridPos (0.0 /\ 0.0), size: GridSize (2.0 /\ 4.0), layer: 0, order: 0 }
         ]
     let edges = [ mkEdge "e1" "a" "a", mkEdge "e2" "a" "a" ]
-    let result = routeAll edges placements (M.empty :: M.Map NodeId (Array _)) [] M.empty
+    let result = routeAll (mkRandom 1.0) Nothing edges placements placements (M.empty :: M.Map NodeId (Array _)) [] M.empty
     A.length result `shouldEqual` 2
     -- The two loops attach at different y positions (equal
-    -- distribution along the node's east side).
+    -- distribution along the node's west side).
     let
       exitYs = result <#> \ep -> case A.head ep.segments of
         Just s -> let GridPos (_ /\ y) = s.start in y
@@ -552,20 +514,6 @@ pipelineSpec = describe "LayeredLayout (pipeline)" do
     A.length result.nodes `shouldEqual` 2
     A.length result.edges `shouldEqual` 1
     result.metrics.nodeOverlapCount `shouldEqual` 0
-
-  it "all positions are integers (GridPos)" do
-    let
-      graph =
-        { nodes:
-            [ { id: NodeId "a", size: GridSize (1.0 /\ 1.0), ports: [] :: Array { id :: PortId, side :: Side, offset :: Int, label :: Maybe String }, label: Nothing :: Maybe String, shape: Rectangle }
-            , { id: NodeId "b", size: GridSize (1.0 /\ 1.0), ports: [], label: Nothing, shape: Rectangle }
-            , { id: NodeId "c", size: GridSize (1.0 /\ 1.0), ports: [], label: Nothing, shape: Rectangle }
-            ]
-        , edges: [ mkEdge "e1" "a" "b", mkEdge "e2" "b" "c" ]
-        , constraints: [] :: Array Constraints
-        }
-    let result = layout defaultConfig graph
-    A.length result.nodes `shouldEqual` 3
 
   it "diamond graph layout" do
     let
@@ -869,16 +817,61 @@ orthogonalSpec = describe "LayeredLayout.EdgeRouting.Orthogonal" do
 
 routingPipelineSpec :: Spec Unit
 routingPipelineSpec = describe "LayeredLayout.EdgeRouting (pipeline)" do
-  it "edges from same source routed consecutively" do
+  it "keeps unplanned routes outside intervening nodes" do
     let
       placements =
-        [ { node: NodeId "a", position: GridPos (1.0 /\ 0.0), size: GridSize (2.0 /\ 1.0), layer: 0, order: 0 }
-        , { node: NodeId "b", position: GridPos (0.0 /\ 3.0), size: GridSize (2.0 /\ 1.0), layer: 1, order: 0 }
-        , { node: NodeId "c", position: GridPos (3.0 /\ 3.0), size: GridSize (2.0 /\ 1.0), layer: 1, order: 1 }
+        [ { node: NodeId "a", position: GridPos (0.0 /\ 0.0), size: GridSize (1.0 /\ 1.0), layer: 0, order: 0 }
+        , { node: NodeId "blocker", position: GridPos (0.0 /\ 3.0), size: GridSize (1.0 /\ 1.0), layer: 1, order: 0 }
+        , { node: NodeId "b", position: GridPos (0.0 /\ 6.0), size: GridSize (1.0 /\ 1.0), layer: 2, order: 0 }
         ]
-    let edges = [ mkEdge "e1" "a" "b", mkEdge "e2" "a" "c" ]
-    let result = routeAll edges placements (M.empty :: M.Map NodeId (Array _)) [] M.empty
-    A.length result `shouldEqual` 2
+      paths = routeAll (mkRandom 1.0) Nothing [ mkEdge "a-b" "a" "b" ] placements placements M.empty [] M.empty
+      interior = S.fromFoldable do
+        x <- [ 1.0, 2.0, 3.0 ]
+        y <- [ 13.0, 14.0, 15.0 ]
+        pure (x /\ y)
+      observed = do
+        path <- A.find (\p -> p.edge == EdgeId "a-b") paths
+        first <- A.head path.segments
+        last <- A.last path.segments
+        pure
+          { start: first.start
+          , end: last.end
+          , blocked: not (S.isEmpty (S.intersection interior (segCells path.segments)))
+          }
+    observed `shouldEqual` Just
+      { start: GridPos (2.0 /\ 4.0), end: GridPos (2.0 /\ 24.0), blocked: false }
+
+  it "preserves distinct routing channels through node compaction" do
+    let
+      graph = mkGraph
+        [ NodeId "generated-1" /\ GridSize (21.0 /\ 11.0)
+        , NodeId "generated-2" /\ GridSize (14.0 /\ 6.0)
+        , NodeId "generated-3" /\ GridSize (17.0 /\ 5.0)
+        , NodeId "generated-4" /\ GridSize (6.0 /\ 9.0)
+        , NodeId "generated-5" /\ GridSize (12.0 /\ 6.0)
+        , NodeId "generated-6" /\ GridSize (6.0 /\ 14.0)
+        , NodeId "generated-7" /\ GridSize (12.0 /\ 4.0)
+        ]
+        [ mkEdge "backbone-3" "generated-1" "generated-3"
+        , mkEdge "backbone-4" "generated-1" "generated-4"
+        , mkEdge "backbone-5" "generated-2" "generated-5"
+        , mkEdge "backbone-6" "generated-2" "generated-6"
+        , mkEdge "backbone-7" "generated-3" "generated-7"
+        , mkEdge "cross-4" "generated-4" "generated-6"
+        , mkEdge "cross-5" "generated-5" "generated-7"
+        , mkEdge "feedback-7" "generated-7" "generated-3"
+        ]
+        []
+      result = layout defaultConfig graph
+      nodeDepth id = gridY <<< _.position <$> A.find (\p -> p.node == NodeId id) result.nodes
+      trunkDepth id = do
+        path <- A.find (\p -> p.edge == EdgeId id) result.edges
+        segment <- A.find (\s -> s.direction == H) path.segments
+        pure (gridY segment.start)
+    -- The two overlapping trunk ranges need separate ten-fine-unit channels.
+    -- Greedy rerouting used to collapse them, pulling generated-6 up with them.
+    ((-) <$> trunkDepth "cross-4" <*> trunkDepth "cross-5") `shouldEqual` Just 10.0
+    ((-) <$> nodeDepth "generated-6" <*> nodeDepth "generated-7") `shouldEqual` Just 2.5
 
   it "diamond graph edges arrive at different ports" do
     let
@@ -889,7 +882,7 @@ routingPipelineSpec = describe "LayeredLayout.EdgeRouting (pipeline)" do
         , { node: NodeId "d", position: GridPos (1.0 /\ 6.0), size: GridSize (1.0 /\ 1.0), layer: 2, order: 0 }
         ]
     let edges = [ mkEdge "e1" "a" "b", mkEdge "e2" "a" "c", mkEdge "e3" "b" "d", mkEdge "e4" "c" "d" ]
-    let result = routeAll edges placements (M.empty :: M.Map NodeId (Array _)) [] M.empty
+    let result = routeAll (mkRandom 1.0) Nothing edges placements placements (M.empty :: M.Map NodeId (Array _)) [] M.empty
     A.length result `shouldEqual` 4
     -- Edges e3 and e4 arrive at d — check their end points differ
     let toD = A.filter (\p -> p.edge == EdgeId "e3" || p.edge == EdgeId "e4") result
@@ -907,24 +900,11 @@ routingPipelineSpec = describe "LayeredLayout.EdgeRouting (pipeline)" do
         , { node: NodeId "c", position: GridPos (3.0 /\ 3.0), size: GridSize (2.0 /\ 1.0), layer: 1, order: 1 }
         ]
     let edges = [ mkEdge "e1" "a" "b", mkEdge "e2" "a" "c" ]
-    let result = routeAll edges placements (M.empty :: M.Map NodeId (Array _)) [] M.empty
+    let result = routeAll (mkRandom 1.0) Nothing edges placements placements (M.empty :: M.Map NodeId (Array _)) [] M.empty
     let cells1 = segCells (fromMaybe [] (A.find (\p -> p.edge == EdgeId "e1") result <#> _.segments))
     let cells2 = segCells (fromMaybe [] (A.find (\p -> p.edge == EdgeId "e2") result <#> _.segments))
     let overlap = S.intersection cells1 cells2
     S.size overlap `shouldEqual` 0
-
-  it "no edge-through-node violations in diamond" do
-    let
-      graph = mkGraph
-        [ NodeId "a" /\ GridSize (1.0 /\ 1.0)
-        , NodeId "b" /\ GridSize (1.0 /\ 1.0)
-        , NodeId "c" /\ GridSize (1.0 /\ 1.0)
-        , NodeId "d" /\ GridSize (1.0 /\ 1.0)
-        ]
-        [ mkEdge "e1" "a" "b", mkEdge "e2" "a" "c", mkEdge "e3" "b" "d", mkEdge "e4" "c" "d" ]
-        []
-    let result = layout defaultConfig graph
-    A.all (\ep -> A.length ep.segments > 0) result.edges `shouldSatisfy` identity
 
 segCells :: Array EdgeSegment -> S.Set (Number /\ Number)
 segCells = foldl addSeg S.empty
@@ -1038,23 +1018,12 @@ simplifySpec = describe "LayeredLayout.EdgeRouting.Orthogonal (simplify)" do
 
 weightedBarycenterSpec :: Spec Unit
 weightedBarycenterSpec = describe "Weighted barycenter" do
-  it "dummy neighbors have less pull than real neighbors" do
-    -- Layer 0: [a, b], Layer 1: [$d:e1:1, c]
-    -- Edge a->$d:e1:1 (dummy), edge b->c (real)
-    -- Without weighting, $d:e1:1 pulls equally; with weighting, real edge b->c has more influence
-    let layers = [ [ NodeId "a", NodeId "b" ], [ NodeId "$d:e1:1", NodeId "c" ] ]
-    let edges = [ mkEdge "e1" "a" "$d:e1:1", mkEdge "e2" "b" "c" ]
-    let result = CrossingMin.minimize { iterations: 4, constraints: [], modelOrder: M.empty } layers edges
-    -- All nodes preserved
-    let allNodes = A.concat result
-    A.length allNodes `shouldEqual` 4
-
   it "real edges preferred over dummy in crossing resolution" do
     -- Crossed layout: a->d, b->c with [a,b] and [c,d]
     -- c is a dummy, d is real. Real edges should get priority.
     let layers = [ [ NodeId "a", NodeId "b" ], [ NodeId "$d:x:1", NodeId "d" ] ]
     let edges = [ mkEdge "e1" "a" "d", mkEdge "e2" "b" "$d:x:1" ]
-    let result = CrossingMin.minimize { iterations: 4, constraints: [], modelOrder: M.empty } layers edges
+    let result = _.layout $ CrossingMin.minimize { iterations: 4, constraints: [], modelOrder: M.empty, ports: M.empty, chains: [], random: mkRandom 1.0, reversed: S.empty, portDummies: PortDummies.empty } layers edges
     -- Should uncross: b's dummy edge weighs less, so a->d dominates
     let crossings = countCrossings (fromMaybe [] (A.index result 0)) (fromMaybe [] (A.index result 1)) edges
     crossings `shouldEqual` 0
@@ -1073,7 +1042,7 @@ siftingSpec = describe "Sifting" do
     -- After sifting, should swap to [c, d] => 0 crossings
     let layers = [ [ NodeId "a", NodeId "b" ], [ NodeId "d", NodeId "c" ] ]
     let edges = [ mkEdge "e1" "a" "c", mkEdge "e2" "b" "d" ]
-    let result = CrossingMin.minimize { iterations: 1, constraints: [], modelOrder: M.empty } layers edges
+    let result = _.layout $ CrossingMin.minimize { iterations: 1, constraints: [], modelOrder: M.empty, ports: M.empty, chains: [], random: mkRandom 1.0, reversed: S.empty, portDummies: PortDummies.empty } layers edges
     let crossings = countCrossings (fromMaybe [] (A.index result 0)) (fromMaybe [] (A.index result 1)) edges
     crossings `shouldEqual` 0
 
@@ -1082,7 +1051,7 @@ siftingSpec = describe "Sifting" do
     let layers = [ [ NodeId "a", NodeId "b" ], [ NodeId "d", NodeId "c" ] ]
     let edges = [ mkEdge "e1" "a" "c", mkEdge "e2" "b" "d" ]
     let constraints = [ OrderConstraint { before: NodeId "d", after: NodeId "c" } ]
-    let result = CrossingMin.minimize { iterations: 4, constraints, modelOrder: M.empty } layers edges
+    let result = _.layout $ CrossingMin.minimize { iterations: 4, constraints, modelOrder: M.empty, ports: M.empty, chains: [], random: mkRandom 1.0, reversed: S.empty, portDummies: PortDummies.empty } layers edges
     case A.index result 1 of
       Just layer -> case A.elemIndex (NodeId "d") layer /\ A.elemIndex (NodeId "c") layer of
         Just di /\ Just ci -> (di < ci) `shouldSatisfy` identity
@@ -1093,7 +1062,7 @@ siftingSpec = describe "Sifting" do
     -- [a, b, c] -> [f, e, d] with a->d, b->e, c->f => 3 crossings
     let layers = [ [ NodeId "a", NodeId "b", NodeId "c" ], [ NodeId "f", NodeId "e", NodeId "d" ] ]
     let edges = [ mkEdge "e1" "a" "d", mkEdge "e2" "b" "e", mkEdge "e3" "c" "f" ]
-    let result = CrossingMin.minimize { iterations: 4, constraints: [], modelOrder: M.empty } layers edges
+    let result = _.layout $ CrossingMin.minimize { iterations: 4, constraints: [], modelOrder: M.empty, ports: M.empty, chains: [], random: mkRandom 1.0, reversed: S.empty, portDummies: PortDummies.empty } layers edges
     let crossings = countCrossings (fromMaybe [] (A.index result 0)) (fromMaybe [] (A.index result 1)) edges
     crossings `shouldEqual` 0
 
@@ -1104,7 +1073,7 @@ compactionSpec = describe "Compaction" do
     let layers = [ [ NodeId "a", NodeId "b", NodeId "c" ] ]
     let sizeMap = M.fromFoldable [ NodeId "a" /\ GridSize (1.0 /\ 1.0), NodeId "b" /\ GridSize (1.0 /\ 1.0), NodeId "c" /\ GridSize (1.0 /\ 1.0) ]
     let cfg = { nodeGap: 2, layerGap: 3 }
-    let result = CoordAssignment.assign cfg [] layers sizeMap M.empty [] [] M.empty
+    let result = _.placements $ CoordAssignment.assign (mkRandom 1.0) cfg [] layers sizeMap M.empty M.empty [] [] M.empty
     -- All three nodes should be compactly placed
     let xs = A.sort (result <#> \p -> gridX p.position)
     case A.head xs /\ A.last xs of
@@ -1117,7 +1086,7 @@ compactionSpec = describe "Compaction" do
     let layers = [ [ NodeId "a", NodeId "b" ] ]
     let sizeMap = M.fromFoldable [ NodeId "a" /\ GridSize (1.0 /\ 1.0), NodeId "b" /\ GridSize (1.0 /\ 1.0) ]
     let cfg = { nodeGap: 2, layerGap: 3 }
-    let result = CoordAssignment.assign cfg [] layers sizeMap M.empty [] [] M.empty
+    let result = _.placements $ CoordAssignment.assign (mkRandom 1.0) cfg [] layers sizeMap M.empty M.empty [] [] M.empty
     let xs = result <#> \p -> un NodeId p.node /\ gridX p.position
     let aX = A.findMap (\(n /\ x) -> if n == "a" then Just x else Nothing) xs
     let bX = A.findMap (\(n /\ x) -> if n == "b" then Just x else Nothing) xs

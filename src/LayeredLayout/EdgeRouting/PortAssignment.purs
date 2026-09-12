@@ -21,7 +21,7 @@ import Data.Maybe (Maybe(..), fromMaybe)
 import Data.Newtype (un)
 import Data.Ord (abs)
 import Data.Tuple.Nested (type (/\), (/\))
-import LayeredLayout.Graph (Edge, EdgeId(..), NodeId(..), Port, PortId, Side(..))
+import LayeredLayout.Graph (Edge, EdgeId(..), Endpoint, NodeId(..), Port, Side(..))
 import LayeredLayout.Grid (gridX, gridY, sizeH, sizeW)
 import LayeredLayout.DummyNodes (isDummy)
 import LayeredLayout.Result (NodePlacement)
@@ -44,15 +44,10 @@ type PortAssignment =
   , toSide :: Side
   }
 
--- | Port of `BaseRoutingDirectionStrategy.getPortPositionOnHyperNode`.
--- | After natural autoPort distribution, every dummy endpoint of a
--- | chain is forced to share the chain's trunk x — the dummy node's
--- | own BK-assigned centre. Every dummy in the chain inherits the
--- | first dummy's centre, so the trunk segment is straight and the
--- | segment from a real source/target node to the trunk picks up a
--- | horizontal kink at its node side. This matches ELK's edge shape
--- | (kink → trunk → kink) where the trunk's column is decided by
--- | the dummy node's BK position, not by the source port.
+-- | Dummy ports follow their own BK-assigned centres. A label-dummy switch
+-- | can leave consecutive ordinary dummies in different columns; copying
+-- | the first dummy's column would move later ports inside unrelated node
+-- | or loop-label envelopes. Aligned chains remain straight naturally.
 assignPorts :: Array Edge -> Array NodePlacement -> Map NodeId (Array Port) -> Array { edgeId :: EdgeId, nodes :: Array NodeId } -> EdgePortOffsets -> Array PortAssignment
 assignPorts edges placements portMap chains portOffsets = natural <#> applyTrunkOverride
   where
@@ -65,58 +60,61 @@ assignPorts edges placements portMap chains portOffsets = natural <#> applyTrunk
 
   sidesMap = M.fromFoldable (edges <#> \e -> e.id /\ bestSides e)
 
-  trunkXBySegId :: Map EdgeId Number
-  trunkXBySegId = M.fromFoldable (A.concatMap trunkEntries chains)
+  dummyPortsBySegId :: Map EdgeId { source :: Maybe Number, target :: Maybe Number }
+  dummyPortsBySegId = M.fromFoldable (A.concatMap dummyPortEntries chains)
 
-  trunkEntries chain
+  dummyPortEntries chain
     | A.length chain.nodes <= 2 = []
-    | otherwise = case dummyCentreX chain of
-        Nothing -> []
-        Just tx -> chainSegmentIds chain <#> \sid -> sid /\ tx
+    | otherwise = A.zipWith
+        ( \source target ->
+            EdgeId (un EdgeId chain.edgeId <> ":" <> un NodeId source <> "->" <> un NodeId target)
+              /\ { source: dummyCentreX source, target: dummyCentreX target }
+        )
+        chain.nodes
+        (A.drop 1 chain.nodes)
 
-  -- Trunk x = the first dummy's centre in fine-grid coordinates.
-  -- All dummies in the chain share a column under BK alignment, so
-  -- the first dummy's centre is the canonical trunk x for the
-  -- whole chain.
-  dummyCentreX chain = case A.index chain.nodes 1 of
-    Nothing -> Nothing
-    Just d1 -> case M.lookup d1 posMap of
-      Nothing -> Nothing
-      Just p -> Just (gridX p.position * sfN + sizeW p.size * sfN / 2.0)
-    where
-    sfN = Int.toNumber scaleFactor
+  dummyCentreX node
+    | not (isDummy node) = Nothing
+    | otherwise =
+        M.lookup node posMap <#> \p ->
+          gridX p.position * sfN + sizeW p.size * sfN / 2.0
+        where
+        sfN = Int.toNumber scaleFactor
 
-  chainSegmentIds chain = A.zipWith
-    (\a b -> EdgeId (un EdgeId chain.edgeId <> ":" <> un NodeId a <> "->" <> un NodeId b))
-    chain.nodes
-    (A.drop 1 chain.nodes)
-
-  applyTrunkOverride a = case M.lookup a.edge.id trunkXBySegId of
+  applyTrunkOverride a = case M.lookup a.edge.id dummyPortsBySegId of
     Nothing -> a
-    Just tx -> do
-      let (_ /\ fy) = a.fromPos
-      let (_ /\ ty) = a.toPos
+    Just ports -> do
+      let (fx /\ fy) = a.fromPos
+      let (tx /\ ty) = a.toPos
       a
-        { fromPos = if isDummy a.edge.from.node then tx /\ fy else a.fromPos
-        , toPos = if isDummy a.edge.to.node then tx /\ ty else a.toPos
+        { fromPos = fromMaybe fx ports.source /\ fy
+        , toPos = fromMaybe tx ports.target /\ ty
         }
 
   assignEdge :: Edge -> PortAssignment
-  assignEdge edge = case edge.from.port /\ edge.to.port of
-    Just fromPortId /\ Just toPortId ->
+  assignEdge edge = case explicitEndpoint edge.from, explicitEndpoint edge.to of
+    Just source, Just target ->
       { edge
-      , fromPos: explicitPort edge.from.node fromPortId South
-      , toPos: explicitPort edge.to.node toPortId North
-      , fromSide: South
-      , toSide: North
+      , fromPos: source.position
+      , toPos: target.position
+      , fromSide: source.side
+      , toSide: target.side
       }
-    _ -> do
+    source, target -> do
       let sides = bestSides edge
       { edge
-      , fromPos: autoPort sides.from edge.from.node edge.id sourceGroups srcOrder _.from
-      , toPos: autoPort sides.to edge.to.node edge.id targetGroups tgtOrder _.to
-      , fromSide: sides.from
-      , toSide: sides.to
+      , fromPos: case source of
+          Just endpoint -> endpoint.position
+          Nothing -> autoPort sides.from edge.from.node edge.id sourceGroups srcOrder _.from
+      , toPos: case target of
+          Just endpoint -> endpoint.position
+          Nothing -> autoPort sides.to edge.to.node edge.id targetGroups tgtOrder _.to
+      , fromSide: case source of
+          Just endpoint -> endpoint.side
+          Nothing -> sides.from
+      , toSide: case target of
+          Just endpoint -> endpoint.side
+          Nothing -> sides.to
       }
 
   bestSides :: Edge -> { from :: Side, to :: Side }
@@ -214,14 +212,13 @@ assignPorts edges placements portMap chains portOffsets = natural <#> applyTrunk
     where
     sfN = Int.toNumber scaleFactor
 
-  explicitPort :: NodeId -> PortId -> Side -> Number /\ Number
-  explicitPort nodeId portId fallbackSide = case M.lookup nodeId posMap of
-    Nothing -> 0.0 /\ 0.0
-    Just placement -> case M.lookup nodeId portMap of
-      Nothing -> defaultPos fallbackSide placement
-      Just ports -> case A.find (\p -> p.id == portId) ports of
-        Nothing -> defaultPos fallbackSide placement
-        Just port -> portToFineGrid placement port
+  explicitEndpoint :: Endpoint -> Maybe { position :: Number /\ Number, side :: Side }
+  explicitEndpoint endpoint = do
+    id <- endpoint.port
+    placement <- M.lookup endpoint.node posMap
+    ports <- M.lookup endpoint.node portMap
+    port <- A.find (\candidate -> candidate.id == id) ports
+    pure { position: portToFineGrid placement port, side: port.side }
 
   -- Port assignment. Prefers the pre-computed `portOffsets` (port of
   -- ELK's `NodeRelativePortDistributor`) when available, since that map
@@ -259,15 +256,6 @@ assignPorts edges placements portMap chains portOffsets = natural <#> applyTrunk
     North -> x /\ (gridY p.position * sfN)
     East -> ((gridX p.position + sizeW p.size) * sfN) /\ x
     West -> (gridX p.position * sfN) /\ x
-    where
-    sfN = Int.toNumber scaleFactor
-
-  defaultPos :: Side -> NodePlacement -> Number /\ Number
-  defaultPos side p = case side of
-    South -> (gridX p.position * sfN + sizeW p.size * sfN / 2.0) /\ ((gridY p.position + sizeH p.size) * sfN)
-    North -> (gridX p.position * sfN + sizeW p.size * sfN / 2.0) /\ (gridY p.position * sfN)
-    East -> ((gridX p.position + sizeW p.size) * sfN) /\ (gridY p.position * sfN + sizeH p.size * sfN / 2.0)
-    West -> (gridX p.position * sfN) /\ (gridY p.position * sfN + sizeH p.size * sfN / 2.0)
     where
     sfN = Int.toNumber scaleFactor
 

@@ -1,3 +1,9 @@
+-- Copyright (c) 2017 Kiel University and others.
+-- SPDX-License-Identifier: EPL-2.0
+-- Translated from ELK c831ba4613dfd6b0055851193956560351d2f907:
+-- NetworkSimplexCompaction.addSeparationConstraints, addEdgeConstraints,
+-- addArtificialSourceNode, and compact.
+--
 -- | Phase 3 of the post-routing graph compaction port.
 -- |
 -- | An `ICompactionAlgorithm` implementation that drives the generic
@@ -63,6 +69,7 @@ type ExtraEdge =
 -- | bump without knowing anything about `LNode` / `VerticalSegment`.
 type CompactionHooks a =
   { sameEdgeVerticalSegments :: CNode a -> CNode a -> Boolean
+  , portAnchoredSegment :: CNode a -> Boolean
   , vsLNodePair :: CNode a -> CNode a -> Boolean
   , edgeLengthEdges :: CGraph a -> Array ExtraEdge
   }
@@ -70,6 +77,7 @@ type CompactionHooks a =
 defaultHooks :: forall a. CompactionHooks a
 defaultHooks =
   { sameEdgeVerticalSegments: \_ _ -> false
+  , portAnchoredSegment: \_ -> false
   , vsLNodePair: \_ _ -> false
   , edgeLengthEdges: \_ -> []
   }
@@ -161,7 +169,16 @@ placeEdge hooks st cNode incNode cg incCg s = do
       + spacing
       - incNode.cGroupOffset.x
   let delta = max 0 (Int.ceil (rawDelta))
-  if hooks.sameEdgeVerticalSegments cNode incNode then addHelperPair cNode incNode cg incCg s
+  -- Upstream defect correction: helper pairs can reverse regular bend
+  -- segments, invalidating the scanline's transitive obstacle ordering.
+  -- The actual ELK scanline and simplex reproduce CENTER crossings on
+  -- generated fixtures 10, 25, and 39 with that topology. Preserve weak
+  -- order for regular segments (same-edge spacing is zero); keep source
+  -- reordering freedom where a north/south port anchor requires it.
+  if
+    hooks.sameEdgeVerticalSegments cNode incNode
+      && (hooks.portAnchoredSegment cNode || hooks.portAnchoredSegment incNode) then
+    addHelperPair cNode incNode cg incCg s
   else do
     let
       weight =
@@ -169,6 +186,10 @@ placeEdge hooks st cNode incNode cg incCg s = do
         else separationWeight
     pushEdge { src: cg, tgt: incCg, delta, weight } s
 
+-- | Source helper topology permits same-edge segments to exchange order.
+-- | Adapter difference: ELK additionally adjusts a fractional LPort.x and
+-- | its group's offset by the ceil rounding remainder. This representation
+-- | has no mutable absolute port position; offsets are used unchanged here.
 addHelperPair
   :: forall a
    . CNode a

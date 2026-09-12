@@ -7,8 +7,8 @@ workspace:
 package:
   name: layered-layout
   publish:
-    version: 0.1.0
-    license: MIT
+    version: 0.0.1
+    license: MIT AND EPL-2.0
     location:
       githubOwner: markgrafhq
       githubRepo: purescript-layered-layout

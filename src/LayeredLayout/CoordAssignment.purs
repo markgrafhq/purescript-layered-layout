@@ -7,6 +7,7 @@ module LayeredLayout.CoordAssignment
   , assignFine
   , assignFineDiag
   , CoordConfig
+  , NodeMargins
   , Diag
   , PassDiag
   , Postprocessable
@@ -21,25 +22,39 @@ module LayeredLayout.CoordAssignment
 import Prelude
 
 import Data.Array as A
+import Data.Either (Either(..))
 import Data.Foldable (foldl)
 import Data.Int as Int
+import Data.List (List(..))
 import Data.Map (Map)
 import Data.Map as M
 import Data.Maybe (Maybe(..), fromMaybe)
-import Data.Newtype (class Newtype, un)
+import Data.Newtype (class Newtype)
 import Data.Set as S
 import Data.Tuple.Nested (type (/\), (/\))
-import LayeredLayout.EdgeRouting.HyperEdges (slotCountByGap)
+import LayeredLayout.EdgeRouting.HyperEdges (SlotInfo, assignSlots, slotCountByGap)
 import LayeredLayout.EdgeRouting.PortAssignment (assignPorts)
-import LayeredLayout.Graph (Alignment(..), Axis(..), Constraints(..), Edge, EdgeId, NodeId(..), Port, Side(..))
+import LayeredLayout.Graph (Alignment(..), Axis(..), Constraints(..), Edge, EdgeId, NodeId(..), Port, PortId, Side(..))
 import LayeredLayout.PortDistribution (EdgePortOffsets, offsetFor)
+import LayeredLayout.PortDummies (isPortDummy)
 import LayeredLayout.Grid (GridPos(..), GridSize(..), gridX, gridY, sizeH, sizeW)
-import LayeredLayout.DummyNodes (isDummy)
+import LayeredLayout.DummyNodes (isDummy, isLabelDummy)
 import LayeredLayout.Result (NodePlacement)
+import LayeredLayout.JavaRandom (Random)
 
 type CoordConfig =
   { nodeGap :: Int
   , layerGap :: Int
+  }
+
+-- | Reserved space around physical nodes, in fine units. `sizeMap`
+-- | includes these margins; port offsets use the same reserved frame.
+type NodeMargins = Map NodeId { left :: Number, right :: Number, top :: Number, bottom :: Number }
+
+type EdgeIndex =
+  { connecting :: Map (NodeId /\ NodeId) Edge
+  , incoming :: Map NodeId (Array Edge)
+  , outgoing :: Map NodeId (Array Edge)
   }
 
 -- | Direction within a layer (Down = left-to-right, Up = right-to-left)
@@ -130,7 +145,7 @@ type Postprocessable =
 sf :: Int
 sf = 4
 
--- | Assign coordinates, returning grid-snapped positions.
+-- | Assign coordinates in grid units without rounding.
 -- |
 -- | The `chains` argument carries the dummy-edge groupings produced by
 -- | `DummyNodes.insertDummies`; we need them to estimate inter-layer
@@ -138,20 +153,24 @@ sf = 4
 -- | router itself runs (ports of `OrthogonalRoutingGenerator` and
 -- | `OrthogonalEdgeRouter.process`).
 assign
-  :: CoordConfig
+  :: Random
+  -> CoordConfig
   -> Array Constraints
   -> Array (Array NodeId)
   -> Map NodeId GridSize
+  -> NodeMargins
   -> Map NodeId (Array Port)
   -> Array Edge
   -> Array { edgeId :: EdgeId, nodes :: Array NodeId }
   -> EdgePortOffsets
-  -> Array NodePlacement
-assign cfg constraints layers sizeMap portMap edges chains portOffsets = applyConstraints constraints result
+  -> { placements :: Array NodePlacement, slots :: Map EdgeId SlotInfo, random :: Random }
+assign random cfg constraints layers sizeMap nodeMargins portMap edges chains portOffsets =
+  { placements: applyConstraints constraints result, slots: routing.slots, random: routing.random }
   where
-  fine = assignFine cfg layers sizeMap portMap edges portOffsets
+  fine = assignFine cfg layers sizeMap nodeMargins portMap edges portOffsets
   layerHeights = layers <#> \layer ->
     foldl (\h nid -> max h (sizeH (fromMaybe (GridSize (1.0 /\ 1.0)) (M.lookup nid sizeMap)))) 1.0 layer
+  depthOffsets = placeWithinLayers layers layerHeights sizeMap nodeMargins edges
   -- ELK's `OrthogonalEdgeRouter.process` walks layers and asks
   -- `OrthogonalRoutingGenerator.routeEdges` for the slot count per gap,
   -- then sets routingWidth = max(nodeNodeSpacing,
@@ -159,8 +178,8 @@ assign cfg constraints layers sizeMap portMap edges chains portOffsets = applyCo
   -- We mirror the slot-count call here using a provisional set of
   -- placements (BK x + uniform layerGap y) so the gap widths feed back
   -- into the final y positions.
-  perGapLayerGaps = computeLayerGaps cfg layers sizeMap portMap edges chains buildProvisional
-  layerYs = cumulativeYWithGaps perGapLayerGaps layerHeights
+  routing = computeLayerGaps random cfg layers portMap edges chains portOffsets buildProvisional
+  layerYs = cumulativeYWithGaps routing.gaps layerHeights
   -- Dummy nodes have no real size; use 0×1 like the BK pass does so
   -- the routing layer (which reads `n.size` to compute the dummy
   -- centre x for trunk routing) sees the same width.
@@ -172,15 +191,14 @@ assign cfg constraints layers sizeMap portMap edges chains portOffsets = applyCo
       let size = fromMaybe fallback (M.lookup nodeId sizeMap)
       let fineX = fromMaybe 0.0 (M.lookup nodeId fine)
       let x = fineX / Int.toNumber sf
-      let y = fromMaybe 0.0 (A.index layerYs layerIdx)
+      let y = fromMaybe 0.0 (A.index layerYs layerIdx) + fromMaybe 0.0 (M.lookup nodeId depthOffsets)
       { node: nodeId, position: GridPos (x /\ y), size, layer: layerIdx, order: orderIdx }
 
   -- Provisional placements built with a candidate per-gap width array.
-  -- The slot computation reads x coordinates for conflict counting;
-  -- y coordinates only feed `gapTop`/`gapBottom` in SlotInfo, which the
-  -- gap formula doesn't depend on. So a uniform layerGap y is fine here.
+  -- Routing conflicts depend on cross-axis coordinates, not absolute
+  -- layer depths, so uniform layer gaps suffice for the shared slot plan.
   buildProvisional :: Array Number -> Array NodePlacement
-  buildProvisional perGapWidths = A.concat $ layers # A.mapWithIndex \layerIdx layer ->
+  buildProvisional perGapWidths = applyConstraints constraints $ A.concat $ layers # A.mapWithIndex \layerIdx layer ->
     layer # A.mapWithIndex \orderIdx nodeId -> do
       let dummyDefault = GridSize (0.0 /\ 1.0)
       let realDefault = GridSize (1.0 /\ 1.0)
@@ -192,6 +210,68 @@ assign cfg constraints layers sizeMap portMap edges chains portOffsets = applyCo
       { node: nodeId, position: GridPos (x /\ y), size, layer: layerIdx, order: orderIdx }
     where
     provisionalLayerYs = cumulativeYWithGaps perGapWidths layerHeights
+
+-- | LGraphUtil.placeNodesHorizontally, transposed to DOWN coordinates.
+-- | Physical port degrees choose the position within a layer's reserved
+-- | depth. Return offsets in the reserved frame used by our placements.
+placeWithinLayers
+  :: Array (Array NodeId)
+  -> Array Number
+  -> Map NodeId GridSize
+  -> NodeMargins
+  -> Array Edge
+  -> Map NodeId Number
+placeWithinLayers layers heights sizeMap nodeMargins edges =
+  foldl placeLayer M.empty (A.mapWithIndex (\i layer -> i /\ layer) layers)
+  where
+  ports = foldl
+    ( \acc edge ->
+        { incoming: addPort acc.incoming edge.id edge.to
+        , outgoing: addPort acc.outgoing edge.id edge.from
+        }
+    )
+    { incoming: M.empty, outgoing: M.empty }
+    edges
+
+  addPort acc edgeId endpoint =
+    M.insertWith S.union endpoint.node (S.singleton key) acc
+    where
+    key = case endpoint.port of
+      Just port -> Left port
+      Nothing -> Right edgeId
+
+  count :: Map NodeId (S.Set (Either PortId EdgeId)) -> NodeId -> Number
+  count byNode node = Int.toNumber (S.size (fromMaybe S.empty (M.lookup node byNode)))
+
+  margin node = fromMaybe { left: 0.0, right: 0.0, top: 0.0, bottom: 0.0 } (M.lookup node nodeMargins)
+
+  placeLayer positions (index /\ layer) = foldl place positions layer
+    where
+    height = fromMaybe 0.0 (A.index heights index) * Int.toNumber sf
+    maximum = foldl
+      ( \acc node ->
+          let
+            m = margin node
+          in
+            { top: max acc.top m.top, bottom: max acc.bottom m.bottom }
+      )
+      { top: 0.0, bottom: 0.0 }
+      layer
+
+    place acc node = do
+      let m = margin node
+      let reserved = sizeH (fromMaybe (GridSize (1.0 /\ 1.0)) (M.lookup node sizeMap)) * Int.toNumber sf
+      let physical = reserved - m.top - m.bottom
+      let incoming = count ports.incoming node
+      let outgoing = count ports.outgoing node
+      let total = incoming + outgoing
+      let ratio = if total == 0.0 then 0.5 else outgoing / total
+      let
+        adjustment =
+          if ratio > 0.5 then -maximum.bottom * 2.0 * (ratio - 0.5)
+          else maximum.top * 2.0 * (0.5 - ratio)
+      let offset = max m.top (min (height - m.bottom - physical) ((height - physical) * ratio + adjustment))
+      M.insert node ((offset - m.top) / Int.toNumber sf) acc
 
 -- | Port of `OrthogonalEdgeRouter.process`'s per-gap routing-width rule:
 -- |
@@ -213,16 +293,20 @@ assign cfg constraints layers sizeMap portMap edges chains portOffsets = applyCo
 -- | The slot computation only reads x-positions for conflict counting,
 -- | so the seed gap doesn't influence its outcome.
 computeLayerGaps
-  :: CoordConfig
+  :: Random
+  -> CoordConfig
   -> Array (Array NodeId)
-  -> Map NodeId GridSize
   -> Map NodeId (Array Port)
   -> Array Edge
   -> Array { edgeId :: EdgeId, nodes :: Array NodeId }
+  -> EdgePortOffsets
   -> (Array Number -> Array NodePlacement)
-  -> Array Number
-computeLayerGaps cfg layers _sizeMap portMap edges chains provisionalFor =
-  A.range 0 (numGaps - 1) <#> gapWidth
+  -> { gaps :: Array Number, slots :: Map EdgeId SlotInfo, random :: Random }
+computeLayerGaps random cfg layers portMap edges chains portOffsets provisionalFor =
+  { gaps: A.mapWithIndex (\index _ -> gapWidth index) baseGaps
+  , slots: planned.slots
+  , random: planned.random
+  }
   where
   numGaps = max 0 (A.length layers - 1)
   baseGap = Int.toNumber cfg.layerGap
@@ -234,12 +318,16 @@ computeLayerGaps cfg layers _sizeMap portMap edges chains provisionalFor =
 
   -- Provisional placements with a uniform baseGap. Used to feed the
   -- slot-count pipeline; result drives the actual gap widths.
-  provisional = provisionalFor (A.replicate numGaps baseGap)
+  baseGaps = A.replicate numGaps baseGap
+  provisional = provisionalFor baseGaps
 
   -- Run the same hyperedge-segment routing the real router will run,
   -- but only collect the slot count per gap.
-  assignments = assignPorts edges provisional portMap chains M.empty
-  slots = slotCountByGap assignments provisional
+  -- Preserve p3's physical port order for labelled and unlabelled graphs;
+  -- redistributing here can reserve a different channel count than routing.
+  assignments = assignPorts edges provisional portMap chains portOffsets
+  planned = assignSlots random assignments provisional
+  slots = slotCountByGap planned.slots
 
   gapWidth gapIdx = case M.lookup gapIdx slots of
     Just n | n > 0 ->
@@ -322,8 +410,8 @@ type Diag =
 
 -- | Assign coordinates in fine-grid resolution (no rounding).
 -- Returns a map from node ID to fine-grid x-coordinate.
-assignFine :: CoordConfig -> Array (Array NodeId) -> Map NodeId GridSize -> Map NodeId (Array Port) -> Array Edge -> EdgePortOffsets -> Map NodeId Number
-assignFine cfg layers sizeMap portMap edges portOffsets = coords
+assignFine :: CoordConfig -> Array (Array NodeId) -> Map NodeId GridSize -> NodeMargins -> Map NodeId (Array Port) -> Array Edge -> EdgePortOffsets -> Map NodeId Number
+assignFine cfg layers sizeMap nodeMargins portMap edges portOffsets = coords
   where
   ni = buildNeighborhood layers edges
   markedEdges = markConflicts ni layers
@@ -344,18 +432,19 @@ assignFine cfg layers sizeMap portMap edges portOffsets = coords
   dummySizes = M.fromFoldable
     (A.concat layers # A.filter isDummy <#> \nid -> nid /\ GridSize (1.0 /\ 1.0))
   fineCfg = { nodeGap: cfg.nodeGap * sf, layerGap: cfg.layerGap }
+  edgeIndex = indexEdges portMap fineSizeMap edges portOffsets
 
-  layout1 = runLayout fineCfg ni layers fineSizeMap portMap edges portOffsets markedEdges VDown HRight
-  layout2 = runLayout fineCfg ni layers fineSizeMap portMap edges portOffsets markedEdges VUp HRight
-  layout3 = runLayout fineCfg ni layers fineSizeMap portMap edges portOffsets markedEdges VDown HLeft
-  layout4 = runLayout fineCfg ni layers fineSizeMap portMap edges portOffsets markedEdges VUp HLeft
+  layout1 = runLayout fineCfg ni layers fineSizeMap portMap edgeIndex portOffsets markedEdges VDown HRight
+  layout2 = runLayout fineCfg ni layers fineSizeMap portMap edgeIndex portOffsets markedEdges VUp HRight
+  layout3 = runLayout fineCfg ni layers fineSizeMap portMap edgeIndex portOffsets markedEdges VDown HLeft
+  layout4 = runLayout fineCfg ni layers fineSizeMap portMap edgeIndex portOffsets markedEdges VUp HLeft
   layouts = [ layout1, layout2, layout3, layout4 ]
 
   -- Port of BKNodePlacer.process selection logic: prefer the balanced
   -- median; if it violates layer ordering (overlapping nodes), fall back
   -- to the smallest-width feasible directional layout. If none are
   -- feasible, default to the first directional layout.
-  balanced = balanceLayouts fineSizeMap layouts
+  balanced = balanceLayouts fineSizeMap nodeMargins layouts
   coords =
     if checkOrderConstraint fineCfg layers fineSizeMap balanced then balanced
     else case smallestFeasible fineCfg layers fineSizeMap layouts of
@@ -364,8 +453,8 @@ assignFine cfg layers sizeMap portMap edges portOffsets = coords
 
 -- | Same as `assignFine` but returns rich per-pass diagnostics for
 -- | inspection. Used only by debug specs.
-assignFineDiag :: CoordConfig -> Array (Array NodeId) -> Map NodeId GridSize -> Map NodeId (Array Port) -> Array Edge -> EdgePortOffsets -> Diag
-assignFineDiag cfg layers sizeMap portMap edges portOffsets =
+assignFineDiag :: CoordConfig -> Array (Array NodeId) -> Map NodeId GridSize -> NodeMargins -> Map NodeId (Array Port) -> Array Edge -> EdgePortOffsets -> Diag
+assignFineDiag cfg layers sizeMap nodeMargins portMap edges portOffsets =
   { layers
   , markedEdges: A.fromFoldable markedEdges
   , passes
@@ -385,11 +474,12 @@ assignFineDiag cfg layers sizeMap portMap edges portOffsets =
   dummySizes = M.fromFoldable
     (A.concat layers # A.filter isDummy <#> \nid -> nid /\ GridSize (1.0 /\ 1.0))
   fineCfg = { nodeGap: cfg.nodeGap * sf, layerGap: cfg.layerGap }
+  edgeIndex = indexEdges portMap fineSizeMap edges portOffsets
 
   passes = combos <#> \(vd /\ hd /\ _lbl) -> do
     let aligned = verticalAlignment ni layers markedEdges vd hd
-    let innerShift = insideBlockShift aligned portMap fineSizeMap edges portOffsets hd
-    let hcRes = horizontalCompactionDiag fineCfg ni layers fineSizeMap portMap edges portOffsets innerShift aligned vd hd
+    let innerShift = insideBlockShift aligned portMap fineSizeMap edgeIndex.connecting portOffsets
+    let hcRes = horizontalCompactionDiag fineCfg ni layers fineSizeMap portMap edgeIndex portOffsets innerShift aligned vd hd
     let withShift = M.mapMaybeWithKey (\nid x -> Just (x + fromMaybe 0.0 (M.lookup nid innerShift))) hcRes.x
     { vdir: vd
     , hdir: hd
@@ -407,7 +497,7 @@ assignFineDiag cfg layers sizeMap portMap edges portOffsets =
     , VUp /\ HLeft /\ "UL"
     ]
   layouts = passes <#> _.x
-  balanced = balanceLayouts fineSizeMap layouts
+  balanced = balanceLayouts fineSizeMap nodeMargins layouts
   feasibleBalanced = checkOrderConstraint fineCfg layers fineSizeMap balanced
   coords =
     if feasibleBalanced then balanced
@@ -454,9 +544,9 @@ markConflicts ni layers =
     let upperLayer = fromMaybe [] (A.index layers i)
     let lowerLayer = fromMaybe [] (A.index layers (i + 1))
     let upperSize = A.length upperLayer
-    scanLower marked lowerLayer upperLayer upperSize i 0 0
+    scanLower marked lowerLayer upperLayer upperSize i 0 0 0
 
-  scanLower marked lowerLayer upperLayer upperSize layerI k0 l = do
+  scanLower marked lowerLayer upperLayer upperSize layerI k0 first l = do
     let lowerSize = A.length lowerLayer
     if l >= lowerSize then marked
     else do
@@ -471,11 +561,13 @@ markConflicts ni layers =
                 Just u -> fromMaybe (upperSize - 1) (M.lookup u ni.nodeIndex)
                 Nothing -> upperSize - 1
             else upperSize - 1
-        let marked' = markRange marked lowerLayer upperLayer k0 k1 l layerI
-        scanLower marked' lowerLayer upperLayer upperSize layerI k1 (l + 1)
-      else scanLower marked lowerLayer upperLayer upperSize layerI k0 (l + 1)
+        let marked' = markRange marked lowerLayer upperLayer k0 k1 first l layerI
+        scanLower marked' lowerLayer upperLayer upperSize layerI k1 (l + 1) (l + 1)
+      else scanLower marked lowerLayer upperLayer upperSize layerI k0 first (l + 1)
 
-  markRange marked lowerLayer _upperLayer k0 k1 upToL layerI =
+  -- Each interval ends at an inner segment (or the layer end). Earlier
+  -- nodes must not be tested again against the next interval's k0.
+  markRange marked lowerLayer _upperLayer k0 k1 first upToL layerI =
     foldl
       ( \m ll -> do
           let vl = fromMaybe (NodeId "") (A.index lowerLayer ll)
@@ -490,7 +582,7 @@ markConflicts ni layers =
             (fromMaybe [] (M.lookup vl ni.preds))
       )
       marked
-      (A.range 0 upToL)
+      (A.range first upToL)
 
   isInnerSegment :: Neighborhood -> NodeId -> Int -> Boolean
   isInnerSegment _ni node _layerI =
@@ -504,8 +596,8 @@ edgeKey (NodeId from) (NodeId to) = MarkedEdge (from <> "→" <> to)
 --  Single directional layout
 -- ══════════════════════════════════════════════════════════════════
 
-runLayout :: CoordConfig -> Neighborhood -> Array (Array NodeId) -> Map NodeId GridSize -> Map NodeId (Array Port) -> Array Edge -> EdgePortOffsets -> S.Set MarkedEdge -> VDir -> HDir -> Map NodeId Number
-runLayout cfg ni layers sizeMap portMap edges portOffsets markedEdges vdir hdir = withShift
+runLayout :: CoordConfig -> Neighborhood -> Array (Array NodeId) -> Map NodeId GridSize -> Map NodeId (Array Port) -> EdgeIndex -> EdgePortOffsets -> S.Set MarkedEdge -> VDir -> HDir -> Map NodeId Number
+runLayout cfg ni layers sizeMap portMap edgeIndex portOffsets markedEdges vdir hdir = withShift
   where
   aligned = verticalAlignment ni layers markedEdges vdir hdir
   -- Port of `BKAligner.insideBlockShift`. For each block in this pass,
@@ -513,8 +605,8 @@ runLayout cfg ni layers sizeMap portMap edges portOffsets markedEdges vdir hdir 
   -- ports of consecutive block members share the same X. Without
   -- explicit ports the shift collapses to 0 and we keep the existing
   -- centre-aligned block placement.
-  innerShift = insideBlockShift aligned portMap sizeMap edges portOffsets hdir
-  xCoords = horizontalCompaction cfg ni layers sizeMap portMap edges portOffsets innerShift aligned vdir hdir
+  innerShift = insideBlockShift aligned portMap sizeMap edgeIndex.connecting portOffsets
+  xCoords = horizontalCompaction cfg ni layers sizeMap portMap edgeIndex portOffsets innerShift aligned vdir hdir
   withShift = M.mapMaybeWithKey
     ( \nid x ->
         Just (x + fromMaybe 0.0 (M.lookup nid innerShift))
@@ -601,12 +693,12 @@ type HCResult =
   , trace :: Array PostProcessTrace
   }
 
-horizontalCompaction :: CoordConfig -> Neighborhood -> Array (Array NodeId) -> Map NodeId GridSize -> Map NodeId (Array Port) -> Array Edge -> EdgePortOffsets -> Map NodeId Number -> AlignResult -> VDir -> HDir -> Map NodeId Number
-horizontalCompaction cfg ni layers sizeMap portMap edges portOffsets innerShift aligned vdir hdir =
-  (horizontalCompactionDiag cfg ni layers sizeMap portMap edges portOffsets innerShift aligned vdir hdir).x
+horizontalCompaction :: CoordConfig -> Neighborhood -> Array (Array NodeId) -> Map NodeId GridSize -> Map NodeId (Array Port) -> EdgeIndex -> EdgePortOffsets -> Map NodeId Number -> AlignResult -> VDir -> HDir -> Map NodeId Number
+horizontalCompaction cfg ni layers sizeMap portMap edgeIndex portOffsets innerShift aligned vdir hdir =
+  (horizontalCompactionDiag cfg ni layers sizeMap portMap edgeIndex portOffsets innerShift aligned vdir hdir).x
 
-horizontalCompactionDiag :: CoordConfig -> Neighborhood -> Array (Array NodeId) -> Map NodeId GridSize -> Map NodeId (Array Port) -> Array Edge -> EdgePortOffsets -> Map NodeId Number -> AlignResult -> VDir -> HDir -> HCResult
-horizontalCompactionDiag cfg ni layers sizeMap portMap edges portOffsets innerShift aligned vdir hdir =
+horizontalCompactionDiag :: CoordConfig -> Neighborhood -> Array (Array NodeId) -> Map NodeId GridSize -> Map NodeId (Array Port) -> EdgeIndex -> EdgePortOffsets -> Map NodeId Number -> AlignResult -> VDir -> HDir -> HCResult
+horizontalCompactionDiag cfg ni layers sizeMap portMap edgeIndex portOffsets innerShift aligned vdir hdir =
   { x: ppResult.x, queue: placed.queue, trace: ppResult.trace }
   where
   nodeW nid = sizeW (fromMaybe (GridSize (1.0 /\ 1.0)) (M.lookup nid sizeMap))
@@ -646,19 +738,10 @@ horizontalCompactionDiag cfg ni layers sizeMap portMap edges portOffsets innerSh
       if v == r then m
       else M.alter (\b -> Just (fromMaybe true b && isDummy v)) r m
 
-  -- Index incident edges by node for quick lookup during threshold
-  -- computation and post-processing. ELK iterates incident edges in
-  -- node-port order; we mirror insertion order from the input edges
-  -- array. Plain `M.insertWith (<>)` reverses the list because the
-  -- new value passes as the first arg of the combiner — appending via
-  -- `M.alter` preserves order.
-  incomingByNode :: Map NodeId (Array Edge)
-  incomingByNode = foldl (appendBy _.to.node) M.empty edges
-
-  outgoingByNode :: Map NodeId (Array Edge)
-  outgoingByNode = foldl (appendBy _.from.node) M.empty edges
-
-  appendBy keyOf m e = M.alter (\v -> Just (fromMaybe [] v <> [ e ])) (keyOf e) m
+  -- Threshold selection and inside-block alignment use the same physical
+  -- port order, precomputed once before the four directional passes.
+  incomingByNode = edgeIndex.incoming
+  outgoingByNode = edgeIndex.outgoing
 
   innerShiftOf :: NodeId -> Number
   innerShiftOf nid = fromMaybe 0.0 (M.lookup nid innerShift)
@@ -745,9 +828,14 @@ horizontalCompactionDiag cfg ni layers sizeMap portMap edges portOffsets innerSh
   --   LONG_EDGE ↔ LONG_EDGE: SPACING_EDGE_EDGE (default 10 fine)
   edgeNodeSpacing = 10.0
   edgeEdgeSpacing = 10.0
+  labelNodeSpacing = 5.0
 
   spacingBetween :: NodeId -> NodeId -> Number
   spacingBetween a b
+    | isPortDummy a && isLabelDummy b || isLabelDummy a && isPortDummy b = labelNodeSpacing
+    | isPortDummy a && isPortDummy b = edgeEdgeSpacing
+    | isPortDummy a || isPortDummy b = edgeNodeSpacing
+    | isLabelDummy a && isLabelDummy b = edgeEdgeSpacing
     | isDummy a && isDummy b = edgeEdgeSpacing
     | isDummy a || isDummy b = edgeNodeSpacing
     | otherwise = Int.toNumber cfg.nodeGap
@@ -796,14 +884,12 @@ horizontalCompactionDiag cfg ni layers sizeMap portMap edges portOffsets innerSh
             let neighborRootX = fromMaybe 0.0 (join (M.lookup neighborRoot st2.x))
             let currentRootX = fromMaybe 0.0 (join (M.lookup rootId st2.x))
             let spacing = spacingBetween currentNode neighbor
-            -- Java BKCompactor.placeBlock formula: subtract neighbor's
-            -- innerShift and add the current node's innerShift to the
-            -- target position so block placement still leaves the
-            -- correct gap between the two NODES (not their block roots).
-            let dShift = innerShiftOf neighbor - innerShiftOf currentNode
+            -- Preserve BKCompactor.placeBlock's evaluation order: subtract
+            -- the current inner shift last. Precomputing a shift difference
+            -- can move a port across a strict routing-conflict boundary.
             case vdir of
               VDown -> do
-                let newPos = neighborRootX + dShift + nodeW neighbor + spacing
+                let newPos = neighborRootX + innerShiftOf neighbor + nodeW neighbor + spacing - innerShiftOf currentNode
                 let newClamped = max newPos thresh'
                 let
                   finalPos =
@@ -811,7 +897,7 @@ horizontalCompactionDiag cfg ni layers sizeMap portMap edges portOffsets innerSh
                     else max currentRootX newClamped
                 { st: st2 { x = M.insert rootId (Just finalPos) st2.x }, initial: false, thresh: thresh' }
               VUp -> do
-                let newPos = neighborRootX + dShift - spacing - nodeW currentNode
+                let newPos = neighborRootX + innerShiftOf neighbor - spacing - nodeW currentNode - innerShiftOf currentNode
                 let newClamped = min newPos thresh'
                 let
                   finalPos =
@@ -855,9 +941,9 @@ horizontalCompactionDiag cfg ni layers sizeMap portMap edges portOffsets innerSh
     else do
       let
         r1 =
-          if isRoot && not (isFiniteThresh oldThresh) then getBound rootId currentNode true st
+          if isRoot && not (isFiniteThresh oldThresh) then getBound currentNode true st
           else { thresh: oldThresh, state: st }
-      if not (isFiniteThresh r1.thresh) && isLast then getBound rootId currentNode false r1.state
+      if not (isFiniteThresh r1.thresh) && isLast then getBound currentNode false r1.state
       else r1
 
   isFiniteThresh :: Number -> Boolean
@@ -867,11 +953,10 @@ horizontalCompactionDiag cfg ni layers sizeMap portMap edges portOffsets innerSh
 
   getBound
     :: NodeId
-    -> NodeId
     -> Boolean
     -> PlaceState
     -> { thresh :: Number, state :: PlaceState }
-  getBound rootId currentNode isRoot st = do
+  getBound currentNode isRoot st = do
     let
       invalid = case vdir of
         VDown -> infNeg
@@ -1114,18 +1199,11 @@ horizontalCompactionDiag cfg ni layers sizeMap portMap edges portOffsets innerSh
     blockFinishedAll = M.fromFoldable
       ((A.nub (A.fromFoldable (M.values aligned.root))) <#> \r -> r /\ true)
 
-  -- | Side of the port on `node` for the given `edge`. Mirrors
-  -- | `insideBlockShift.orient`: HRight passes have edges flowing
-  -- | source.south → target.north (top-to-bottom layer flow); HLeft
-  -- | reverses.
+  -- | Sweep direction changes block traversal, not physical ports.
+  -- | This must agree with insideBlockShift and getBound, including
+  -- | fixed off-centre label ports.
   sideOfEndpoint :: Edge -> NodeId -> Side
-  sideOfEndpoint e node = do
-    let isSource = e.from.node == node
-    case isSource /\ hdir of
-      true /\ HRight -> South
-      true /\ HLeft -> North
-      false /\ HRight -> North
-      false /\ HLeft -> South
+  sideOfEndpoint e node = if e.from.node == node then South else North
 
   -- | Absolute port x for a node endpoint of an edge, given the
   -- | current per-node x map. Mirrors ELK's
@@ -1208,6 +1286,65 @@ getBlockRing aligned rootId = go (fromMaybe rootId (M.lookup rootId aligned.alig
 --  insideBlockShift (port of BKAligner.insideBlockShift)
 -- ══════════════════════════════════════════════════════════════════
 
+-- | BKNodePlacer.getEdge and ThresholdStrategy.pickEdge both scan the
+-- | current node's connected ports, not the graph's edge list. Build
+-- | their indices once for all four passes. ELK's clockwise port order
+-- | transposes to WEST/SOUTH/EAST/NORTH in our DOWN coordinates.
+indexEdges
+  :: Map NodeId (Array Port)
+  -> Map NodeId GridSize
+  -> Array Edge
+  -> EdgePortOffsets
+  -> EdgeIndex
+indexEdges portMap fineSizeMap edges portOffsets =
+  { connecting: map _.edge indexed.connecting
+  , incoming: map ordered indexed.incoming
+  , outgoing: map ordered indexed.outgoing
+  }
+  where
+  indexed = foldl addEdge
+    { connecting: M.empty, incoming: M.empty, outgoing: M.empty, next: 0 }
+    edges
+
+  ordered entries = map _.edge $ A.sortBy (\a b -> compare a.order b.order) $ A.fromFoldable entries
+
+  addEdge acc e = do
+    let source = endpoint e e.from.node South acc.next
+    let target = endpoint e e.to.node North acc.next
+    { connecting: addConnection e.to.node e.from.node target
+        (addConnection e.from.node e.to.node source acc.connecting)
+    , incoming: M.insertWith (\old new -> new <> old) e.to.node (Cons target Nil) acc.incoming
+    , outgoing: M.insertWith (\old new -> new <> old) e.from.node (Cons source Nil) acc.outgoing
+    , next: acc.next + 1
+    }
+
+  addConnection node other candidate = M.insertWith
+    (\existing next -> if next.order < existing.order then next else existing)
+    (node /\ other)
+    candidate
+
+  endpoint e node defaultSide index = do
+    let
+      port = endpointPort portMap e node
+      side = fromMaybe defaultSide (port <#> _.side)
+      width = sizeW (fromMaybe (GridSize (1.0 /\ 1.0)) (M.lookup node fineSizeMap))
+      offset = case port of
+        Just p -> Int.toNumber p.offset * Int.toNumber sf
+        Nothing -> offsetFor portOffsets e.id side (width / 2.0)
+      position = case side of
+        West -> 0 /\ offset
+        South -> 1 /\ offset
+        East -> 2 /\ negate offset
+        North -> 3 /\ negate offset
+    -- Equal/shared ports retain their incident-edge insertion order.
+    { edge: e, order: position /\ index }
+
+endpointPort :: Map NodeId (Array Port) -> Edge -> NodeId -> Maybe Port
+endpointPort portMap e node = do
+  pid <- if e.from.node == node then e.from.port else e.to.port
+  ports <- M.lookup node portMap
+  A.find (\p -> p.id == pid) ports
+
 -- | For each block, walk the align ring; for every consecutive pair
 -- | (current, next) connected by an edge, compute the X-offset between
 -- | the connected ports so the edge becomes a straight vertical line:
@@ -1227,11 +1364,10 @@ insideBlockShift
   :: AlignResult
   -> Map NodeId (Array Port)
   -> Map NodeId GridSize
-  -> Array Edge
+  -> Map (NodeId /\ NodeId) Edge
   -> EdgePortOffsets
-  -> HDir
   -> Map NodeId Number
-insideBlockShift aligned portMap fineSizeMap edges portOffsets hdir =
+insideBlockShift aligned portMap fineSizeMap connectedEdges portOffsets =
   foldl shiftBlock M.empty roots
   where
   roots = A.nub (A.fromFoldable (M.values aligned.root))
@@ -1264,26 +1400,15 @@ insideBlockShift aligned portMap fineSizeMap edges portOffsets hdir =
 
   -- portPosDiff prev nxt = prevPortX - nextPortX (relative to node x).
   -- After: nxt.x + nextPortX == prev.x + prevPortX.
-  portPosDiff prev nxt = case findEdge prev nxt of
+  portPosDiff prev nxt = case M.lookup (prev /\ nxt) connectedEdges of
     Nothing -> 0.0
     Just e -> do
-      let { source, sourceSide, target, targetSide } = orient e prev nxt
+      let { source, sourceSide, targetSide } = orient e prev nxt
       let prevSide = if source == prev then sourceSide else targetSide
       let nxtSide = if source == nxt then sourceSide else targetSide
       let prevX = edgePortX e prev prevSide
       let nxtX = edgePortX e nxt nxtSide
       prevX - nxtX
-
-  -- Match an edge between the two nodes; either direction.
-  findEdge a b = A.find
-    ( \e ->
-        let
-          s = e.from.node
-          t = e.to.node
-        in
-          (s == a && t == b) || (s == b && t == a)
-    )
-    edges
 
   orient e _ _ = do
     let source = e.from.node
@@ -1312,14 +1437,8 @@ insideBlockShift aligned portMap fineSizeMap edges portOffsets hdir =
       Nothing -> offsetFor portOffsets e.id side centre
 
   explicitPortX :: Edge -> NodeId -> Maybe Number
-  explicitPortX e node = do
-    pid <- case e.from.node == node, e.to.node == node of
-      true, _ -> e.from.port
-      _, true -> e.to.port
-      _, _ -> Nothing
-    ports <- M.lookup node portMap
-    p <- A.find (\pp -> pp.id == pid) ports
-    Just (Int.toNumber p.offset * Int.toNumber sf)
+  explicitPortX e node = endpointPort portMap e node <#> \p ->
+    Int.toNumber p.offset * Int.toNumber sf
 
 -- ══════════════════════════════════════════════════════════════════
 --  Class placement (longest path on class graph)
@@ -1382,12 +1501,14 @@ placeClasses classEdges sinkMap vdir = shifts
 -- | `max` boundary adds nodeWidth so a zero-width dummy at x=K doesn't
 -- | out-rank a real node at x=K-w+ε (matching ELK's `nodePosY +
 -- | n.getSize().y`).
-balanceLayouts :: Map NodeId GridSize -> Array (Map NodeId Number) -> Map NodeId Number
-balanceLayouts sizeMap layouts = normalizeLayout balanced
+balanceLayouts :: Map NodeId GridSize -> NodeMargins -> Array (Map NodeId Number) -> Map NodeId Number
+balanceLayouts sizeMap nodeMargins layouts = normalizeLayout balanced
   where
   nodeW nid = sizeW (fromMaybe (GridSize (1.0 /\ 1.0)) (M.lookup nid sizeMap))
+  marginStart nid = fromMaybe 0.0 (M.lookup nid nodeMargins <#> _.left)
+  marginEnd nid = fromMaybe 0.0 (M.lookup nid nodeMargins <#> _.right)
 
-  sized = A.mapWithIndex (\i l -> { i, l, w: layoutSize l }) layouts
+  sized = A.mapWithIndex (\i l -> { i, l, w: layoutSize sizeMap l }) layouts
   refIdx = case A.head (A.sortBy (\a b -> compare a.w b.w) sized) of
     Just s -> s.i
     Nothing -> 0
@@ -1416,9 +1537,14 @@ balanceLayouts sizeMap layouts = normalizeLayout balanced
     M.empty
     allKeys
 
-  minVal m = foldl min 999999.0 (M.values m)
+  -- The reference size includes reserved margins, but balancing aligns
+  -- the physical node boundaries (BKNodePlacer.createBalancedLayout).
+  minVal m = foldl
+    (\acc (nid /\ x) -> min acc (x + marginStart nid))
+    999999.0
+    (M.toUnfoldable m :: Array (NodeId /\ Number))
   maxVal m = foldl
-    (\acc (nid /\ x) -> max acc (x + nodeW nid))
+    (\acc (nid /\ x) -> max acc (x + nodeW nid - marginEnd nid))
     (-999999.0)
     (M.toUnfoldable m :: Array (NodeId /\ Number))
 
@@ -1457,7 +1583,7 @@ smallestFeasible
 smallestFeasible cfg layers sizeMap candidates = A.head sorted <#> _.l
   where
   feasible = candidates # A.filter (checkOrderConstraint cfg layers sizeMap)
-  sized = feasible <#> \l -> { l, w: layoutSize l }
+  sized = feasible <#> \l -> { l, w: layoutSize sizeMap l }
   sorted = A.sortBy (\a b -> compare a.w b.w) sized
 
 normalizeLayout :: Map NodeId Number -> Map NodeId Number
@@ -1467,12 +1593,21 @@ normalizeLayout m = do
   if minX == 0.0 || A.length vals == 0 then m
   else map (\x -> x - minX) m
 
-layoutSize :: Map NodeId Number -> Number
-layoutSize m = do
-  let vals = M.values m
-  let mn = foldl min 999999.0 vals
-  let mx = foldl max (-999999.0) vals
-  mx - mn
+-- | Inner shifts are already included in coordinates. The bounding
+-- | interval of all reserved node rectangles equals the extent of the
+-- | aligned blocks, including zero-width nodes and dummy edge thickness.
+layoutSize :: Map NodeId GridSize -> Map NodeId Number -> Number
+layoutSize sizeMap positions = bounds.maximum - bounds.minimum
+  where
+  bounds = foldl
+    ( \acc (nid /\ x) ->
+        let
+          width = sizeW (fromMaybe (GridSize (1.0 /\ 1.0)) (M.lookup nid sizeMap))
+        in
+          { minimum: min acc.minimum x, maximum: max acc.maximum (x + width) }
+    )
+    { minimum: 999999.0, maximum: -999999.0 }
+    (M.toUnfoldable positions :: Array (NodeId /\ Number))
 
 -- ══════════════════════════════════════════════════════════════════
 --  Utilities

@@ -1,4 +1,4 @@
-module LayeredLayout.DummyNodes (insertDummies, DummyResult, isDummy) where
+module LayeredLayout.DummyNodes (insertDummies, DummyResult, isDummy, isLabelDummy) where
 
 import Prelude
 
@@ -37,8 +37,8 @@ insertDummies nodeLayer edges layers = foldl processEdge { layers: layers, edges
         newEdges = A.zipWith
           ( \a b ->
               { id: EdgeId (edgeKey <> ":" <> un NodeId a <> "->" <> un NodeId b)
-              , from: { node: a, port: edge.from.port }
-              , to: { node: b, port: edge.to.port }
+              , from: { node: a, port: if a == fromId then edge.from.port else Nothing }
+              , to: { node: b, port: if b == toId then edge.to.port else Nothing }
               , label: Nothing
               }
           )
@@ -62,3 +62,6 @@ insertDummies nodeLayer edges layers = foldl processEdge { layers: layers, edges
 
 isDummy :: NodeId -> Boolean
 isDummy nid = Str.take 3 (un NodeId nid) == "$d:"
+
+isLabelDummy :: NodeId -> Boolean
+isLabelDummy nid = Str.take 7 (un NodeId nid) == "$label:"

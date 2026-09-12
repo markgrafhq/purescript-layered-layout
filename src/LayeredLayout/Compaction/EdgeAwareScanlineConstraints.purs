@@ -1,3 +1,9 @@
+-- Copyright (c) 2017 Kiel University and others.
+-- SPDX-License-Identifier: EPL-2.0
+-- Translated from ELK c831ba4613dfd6b0055851193956560351d2f907:
+-- EdgeAwareScanlineConstraintCalculation.calculateForOrthogonal,
+-- alterHitbox, alterGroupedHitboxOrthogonal; ScanlineConstraintCalculator.
+--
 -- | Port of ELK's `ScanlineConstraintCalculator` +
 -- | `EdgeAwareScanlineConstraintCalculation`. See
 -- | `EdgeAwareScanlineConstraintsSpec` for the worked examples.
@@ -21,6 +27,7 @@ import LayeredLayout.Compaction.OneD
   , IConstraintCalculationAlgorithm(..)
   , allCGroups
   , allCNodes
+  , lookupCGroup
   , lookupCNode
   , updateCNode
   )
@@ -32,21 +39,16 @@ import LayeredLayout.Compaction.OneD
 -- | Pure base scanline: one sweep over every CNode, no hitbox inflation.
 scanlineConstraints :: forall a. IConstraintCalculationAlgorithm a
 scanlineConstraints = IConstraintCalculationAlgorithm \st ->
-  sweep (\_ -> true) (clearConstraints st.cGraph)
+  sweep (\_ -> true) st.cGraph
 
--- | Edge-aware scanline for the orthogonal edge-routing case. Three
--- | phases of inflate → sweep → restore, accumulating constraints in
--- | the original (un-inflated) graph. The `edgeEdgeSpacing` is the same
--- | value the compactor's spacings handler returns for an edge/edge
--- | pair — both read it from the layout config so they never diverge.
-edgeAwareScanlineConstraints :: forall a. Number -> IConstraintCalculationAlgorithm a
-edgeAwareScanlineConstraints edgeEdgeSpacing = IConstraintCalculationAlgorithm \st ->
-  edgeAwareOrthogonal edgeEdgeSpacing (clearConstraints st.cGraph)
-
-clearConstraints :: forall a. CGraph a -> CGraph a
-clearConstraints g = foldl reset g (allCNodes g)
-  where
-  reset acc n = updateCNode n.id (_ { constraints = [] }) acc
+-- | Orthogonal edge-aware scanline. Constraints accumulate across all
+-- | three sweeps and preserve the lifecycle's predefined constraints.
+edgeAwareScanlineConstraints
+  :: forall a
+   . { nodeNode :: Number, edgeEdge :: Number }
+  -> IConstraintCalculationAlgorithm a
+edgeAwareScanlineConstraints spacings = IConstraintCalculationAlgorithm \st ->
+  edgeAwareOrthogonal spacings st.cGraph
 
 ----------------------------------------------------------------
 -- Orthogonal driver: three phases of inflate → sweep → restore.
@@ -55,25 +57,21 @@ clearConstraints g = foldl reset g (allCNodes g)
 --   3. full sweep with group masters + member VSes inflated
 ----------------------------------------------------------------
 
-edgeAwareOrthogonal :: forall a. Number -> CGraph a -> CGraph a
-edgeAwareOrthogonal edgeEdgeSpacing g0 = do
-  let inflate = inflateBy edgeEdgeSpacing
-  let g1 = sweepInto g0 isVS (inflateAll inflate g0 isVS)
-  let g2 = sweepInto g1 isLNode (inflateAll inflate g1 isLNode)
-  sweepInto g2 (\_ -> true) (inflateGroups inflate g2)
-
--- | Run a sweep over the *inflated* graph and merge the constraints it
--- | discovers into `base`, whose un-inflated geometry is preserved.
--- | This is the functional analogue of ELK's blow-up → sweep →
--- | normalize cycle: inflation is local to one sweep and never leaks
--- | into the next phase or into the final hitboxes.
-sweepInto
+edgeAwareOrthogonal
   :: forall a
-   . CGraph a
-  -> (CNode a -> Boolean)
+   . { nodeNode :: Number, edgeEdge :: Number }
   -> CGraph a
   -> CGraph a
-sweepInto base filt inflated = applyConstraints (sweepConstraints filt inflated) base
+edgeAwareOrthogonal spacings g0 = do
+  let spacing = inflateBy spacings.edgeEdge
+  let g1 = inflateAll (-spacing) (sweep isVS (inflateAll spacing g0 isVS)) isVS
+  let g2 = inflateAll (-spacing) (sweep isLNode (inflateAll spacing g1 isLNode)) isLNode
+  let
+    nodeSpacing n = inflateBy (if isVS n then spacings.edgeEdge else spacings.nodeNode)
+    minSpacing = case A.uncons (allCNodes g2) of
+      Nothing -> 0.0
+      Just { head, tail } -> foldl (\acc n -> min acc (nodeSpacing n)) (nodeSpacing head) tail
+  inflateGroups (-minSpacing) (sweep (\_ -> true) (inflateGroups minSpacing g2))
 
 isVS :: forall a. CNode a -> Boolean
 isVS n = n.kind == Just "vs"
@@ -85,17 +83,9 @@ isLNode n = not (isVS n)
 -- Hitbox inflation
 ----------------------------------------------------------------
 
--- | Hitbox inflation for one sweep. Both the VS sweep and the LNode
--- | sweep inflate by *edge-edge* spacing (not node-node) so nodes pack
--- | as tightly as the edges allow. The `edgeEdgeSpacing` is ELK's
--- | `verticalEdgeEdgeSpacing` (`LayeredOptions.SPACING_EDGE_EDGE`,
--- | default 10), threaded in from the layout config so it stays in
--- | lock-step with the value the compactor's spacings handler hands
--- | back for an edge/edge pair. It is **not** the node grid
--- | `scaleFactor`: the scanline inflates hitboxes by
--- | `edgeEdgeSpacing / 2 - epsilon`, so using the grid factor here
--- | under-inflates nodes and drops the node↔long-edge separation
--- | constraints ELK generates.
+-- | ELK uses global edge-edge spacing for the first two sweeps,
+-- | then the minimum of global node-node and edge-edge half-spacing
+-- | for the complete sweep. These are not between-layer spacings.
 inflateBy :: Number -> Number
 inflateBy edgeEdgeSpacing = max 0.0 (edgeEdgeSpacing / 2.0 - epsilon)
 
@@ -105,9 +95,9 @@ epsilon = 0.5
 smallEpsilon :: Number
 smallEpsilon = 0.01
 
--- | Phase 1/2 helper: inflate every CNode that satisfies `filt`. VSes
--- | grow on the side(s) their `ignoreSpacing` flags don't veto; LNodes
--- | grow on both sides by the full spacing.
+-- | Signed spacing is ELK's spacing * fac. SMALL_EPSILON remains
+-- | positive on restoration too, matching alterHitbox exactly; restoring
+-- | a vertical segment therefore retains the source's 0.02 hitbox change.
 inflateAll
   :: forall a
    . Number
@@ -200,10 +190,13 @@ sweepConstraints
   -> CGraph a
   -> Map CNodeId (Array CNodeId)
 sweepConstraints filt g = do
-  let included = A.filter filt (allCNodes g)
+  -- Empty intervals have no sweep interior. Emitting their high event
+  -- before their low event would leave them active forever and create
+  -- spurious barriers, including positive cycles between node groups.
+  let included = A.filter (\node -> filt node && node.hitbox.height > 0.0) (allCNodes g)
   let events = A.sortBy cmpEvent (included >>= twoEvents)
   let result = foldl handle initial events
-  result.constraints
+  projectGroupMasters filt g result.constraints
   where
   initial = { intervals: ([] :: Array (CNode a)), cand: M.empty, constraints: M.empty }
   twoEvents n = [ { node: n, low: true }, { node: n, low: false } ]
@@ -215,6 +208,60 @@ type Handler a =
   , cand :: Map CNodeId (Maybe CNodeId)
   , constraints :: Map CNodeId (Array CNodeId)
   }
+
+-- | Correct the upstream sweep's grouped-obstacle shadowing: an interior
+-- | member can hide its master's reserved frame. Retain the member's
+-- | constraint (its spacing may be stronger) and protect the master too.
+-- | Only overlapping transverse interiors with an already-valid
+-- | longitudinal order can contribute a projected constraint.
+projectGroupMasters
+  :: forall a
+   . (CNode a -> Boolean)
+  -> CGraph a
+  -> Map CNodeId (Array CNodeId)
+  -> Map CNodeId (Array CNodeId)
+projectGroupMasters filt g found = foldl projectSource found
+  (M.toUnfoldable found :: Array (CNodeId /\ Array CNodeId))
+  where
+  projectSource acc (sourceId /\ targets) = case lookupCNode sourceId g of
+    Nothing -> acc
+    Just source -> foldl (projectTarget source (masterFor source)) acc targets
+
+  projectTarget source sourceMaster acc targetId = case lookupCNode targetId g of
+    Nothing -> acc
+    Just target ->
+      let
+        targetMaster = masterFor target
+        withSource = case sourceMaster of
+          Nothing -> acc
+          Just master -> add master target acc
+        withTarget = case targetMaster of
+          Nothing -> withSource
+          Just master -> add source master withSource
+      in
+        case sourceMaster, targetMaster of
+          Just a, Just b -> add a b withTarget
+          _, _ -> withTarget
+
+  masterFor node = do
+    groupId <- node.cGroup
+    group <- lookupCGroup groupId g
+    masterId <- case group.master of
+      Just id -> Just id
+      Nothing -> A.head group.cNodes
+    if masterId == node.id then Nothing
+    else do
+      master <- lookupCNode masterId g
+      if filt master then Just master else Nothing
+
+  add source target acc
+    | source.cGroup == target.cGroup = acc
+    | source.hitbox.x + source.hitbox.width > target.hitbox.x = acc
+    | max source.hitbox.y target.hitbox.y >=
+        min (source.hitbox.y + source.hitbox.height) (target.hitbox.y + target.hitbox.height) = acc
+    | A.elem target.id source.constraints = acc
+    | A.elem target.id (fromMaybe [] (M.lookup source.id acc)) = acc
+    | otherwise = addConstraint source.id target.id acc
 
 -- | Sort events by y; on ties, high comes before low so nodes that
 -- | *barely* touch don't pick up a constraint.

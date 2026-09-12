@@ -1,3 +1,7 @@
+-- Copyright (c) 2010, 2012, 2015, 2016, 2020 Kiel University and others.
+-- SPDX-License-Identifier: EPL-2.0
+-- Port of ELK's SortByInputModelProcessor, BarycenterHeuristic,
+-- LayerSweepCrossingMinimizer and two-sided GreedySwitchHeuristic.
 module LayeredLayout.CrossingMin
   ( minimize
   , countCrossings
@@ -7,524 +11,478 @@ module LayeredLayout.CrossingMin
 import Prelude
 
 import Data.Array as A
-import Data.Foldable (foldl, sum)
-import Data.Int as Int
+import Data.Foldable (foldl, minimum, sum)
 import Data.Int (toNumber)
+import Data.List (List(..))
 import Data.Map (Map)
 import Data.Map as M
-import Data.Maybe (Maybe(..), fromMaybe, maybe)
+import Data.Maybe (Maybe(..), fromMaybe)
+import Data.Newtype (un)
 import Data.Set as S
 import Data.Tuple.Nested (type (/\), (/\))
-import LayeredLayout.Graph (Constraints(..), Edge, EdgeId, NodeId)
+import LayeredLayout.CrossingMin.Ports (Ports)
+import LayeredLayout.CrossingMin.Ports as P
+import LayeredLayout.CrossingMin.Constraints as ConstraintGroups
+import LayeredLayout.CrossingMin.NorthSouth as NS
+import LayeredLayout.DummyNodes (isDummy, isLabelDummy)
+import LayeredLayout.Graph (Constraints(..), Edge, EdgeId(..), NodeId(..), Port, Side(..))
 import LayeredLayout.JavaRandom (Random)
 import LayeredLayout.JavaRandom as JR
+import LayeredLayout.PortDistribution (PortOrder)
+import LayeredLayout.PortDummies as PortDummies
 
 type Config =
   { iterations :: Int
   , constraints :: Array Constraints
   , modelOrder :: Map NodeId Int
+  , ports :: Map NodeId (Array Port)
+  , chains :: Array { edgeId :: EdgeId, nodes :: Array NodeId }
+  , random :: Random
+  , reversed :: S.Set EdgeId
+  , portDummies :: PortDummies.State
   }
 
--- | Port of `LayerSweepCrossingMinimizer.process()` from
--- | `org.eclipse.elk.alg.layered.p3order.LayerSweepCrossingMinimizer`.
--- |
--- | Multi-run randomized layer sweep:
--- |   1. `compareDifferentRandomizedLayouts` runs THOROUGHNESS iterations
--- |   2. Each iteration calls `minimizeCrossingsWithCounter` which:
--- |        * picks a random sweep direction via `random.nextBoolean()`
--- |        * randomizes the first-layer barycenters (`setFirstLayerOrder`)
--- |        * sweeps until no further crossing reduction (alternating direction)
--- |   3. The layout with the fewest total crossings is kept (best-of-N).
--- |
--- | The single shared `Random` instance threads through all iterations,
--- | matching ELK's `random = rootGraph.getProperty(InternalProperties.RANDOM)`
--- | and the `random.setSeed(randomSeed)` reset that is performed once at the
--- | start of `compareDifferentRandomizedLayouts`.
-minimize :: Config -> Array (Array NodeId) -> Array Edge -> Array (Array NodeId)
+type Order = { layout :: Array (Array NodeId), ports :: Ports }
+
+minimize :: Config -> Array (Array NodeId) -> Array Edge -> { layout :: Array (Array NodeId), random :: Random, portOrder :: PortOrder }
 minimize cfg layers edges =
-  if A.length layers <= 0 || cfg.iterations <= 0 then layers else best.layout
+  { layout: final.layout, portOrder: P.toOrder final.ports, random: finalRandom }
   where
-  thoroughness = cfg.iterations
-  orderConstraintss = orderConstraintsOf cfg.constraints
-
-  -- markgraf deviation from ELK: only shuffle connected nodes during
-  -- randomization. Disconnected nodes have no influence on crossings, and
-  -- shuffling them would disturb their layout (e.g. for locked-but-disconnected
-  -- nodes that should not perturb the connected subgraph).
-  connectedNodes = foldl
-    (\s e -> S.insert (e.from.node) (S.insert (e.to.node) s))
-    S.empty
-    edges
-
-  initialRandom = afterReset
-    where
-    -- ELK: random = new Random(seed); randomSeed = random.nextLong();
-    -- compareDifferentRandomizedLayouts: random.setSeed(randomSeed).
-    -- setSeed(s) and `new Random(s)` both apply (s XOR multiplier) AND mask48,
-    -- so `mkRandomBI seed` reproduces `setSeed(seed)`.
-    --
-    -- BigInt-precision is required: Random(1).nextLong() = -4964420948893066024
-    -- exceeds Number's 53-bit mantissa, so a Number-typed nextLong silently
-    -- drops low-order bits, the subsequent setSeed lands on a different
-    -- state from ELK, and every following `next 24` jitter call produces
-    -- different bits — flipping tie-break sort decisions (Cycle (loop)
-    -- L2 forward sweep was the smoking gun).
-    rootRandom = JR.mkRandom 1.0
-    randomSeed /\ _ = JR.nextLongBI rootRandom
-    afterReset = JR.mkRandomBI randomSeed
-
-  -- ELK `$compareDifferentRandomizedLayouts` (line 51182) sets
-  -- FIRST_TRY_WITH_INITIAL_ORDER=true at the start when strategy != NONE.
-  -- The flag tracks across iterations and overrides the random sweep
-  -- direction inside `$minimizeCrossingsWithCounter` (line 51365):
-  -- iter 0 (FIRST_TRY=true) → forward sweep; iter 1 (SECOND_TRY=true,
-  -- FIRST_TRY=false) → backward; iter 2+ honour the random bit.
-  -- The random bit is still consumed at line 51360 even when
-  -- overridden, so RNG advancement matches across implementations.
-  initialFirstTry = not (M.isEmpty cfg.modelOrder)
-
-  best = (foldl runIteration seed (A.range 1 thoroughness)).result
-    where
-    seed =
-      { result: { layout: layers, crossings: top, random: initialRandom }
-      , firstTry: initialFirstTry
-      , secondTry: false
+  seed /\ constructionRandom = JR.nextLongBI cfg.random
+  relative /\ _ = JR.nextBoolean constructionRandom
+  initialRandom = JR.mkRandomBI seed
+  constraints = A.mapMaybe
+    ( case _ of
+        OrderConstraint c -> Just c
+        _ -> Nothing
+    )
+    cfg.constraints
+  modelActive = not (M.isEmpty cfg.modelOrder)
+  northSouth = NS.metadata cfg.portDummies cfg.ports
+  initial = seeded
+    { layout = map
+        ( \layer ->
+            if M.isEmpty northSouth.dummies || A.null constraints then enforce constraints layer
+            else resolveUnits northSouth constraints (A.mapWithIndex (\i node -> { node, key: toNumber i }) layer)
+        )
+        seeded.layout
+    }
+  beforeNS = PortDummies.unprepare cfg.portDummies { layers, edges, chains: cfg.chains }
+  modelSorted = preprocess cfg beforeNS.edges { layout: beforeNS.layers, ports: P.build cfg.ports beforeNS.edges }
+  seeded =
+    if A.null cfg.portDummies.dummies then modelSorted
+    else
+      { layout: PortDummies.expand cfg.portDummies modelSorted.layout
+      , ports: P.rewire cfg.ports edges modelSorted.ports
       }
-    top = 1000000000 -- ELK: Integer.MAX_VALUE; any concrete sentinel suffices.
-
-  runIteration acc _
-    | acc.result.crossings == 0 = acc -- ELK early-exit: bestCrossings == 0 ⇒ break
-    | otherwise = do
-        let res = minimizeCrossingsWithCounter acc.result.random acc.firstTry acc.secondTry
+  active = cfg.iterations > 0 && A.length (A.concat layers) > 1
+  trials = foldl trial
+    { current: initial, best: initial, score: 2147483647, random: initialRandom }
+    (A.range 0 (max 0 cfg.iterations - 1))
+  trial acc index
+    | not active || acc.score == 0 = acc
+    | otherwise =
         let
-          nextResult =
-            if res.crossings < acc.result.crossings then { layout: res.layout, crossings: res.crossings, random: res.random }
-            else acc.result { random = res.random }
-        let secondAfter = if acc.secondTry then false else acc.secondTry
+          -- ELK 0.11.1 effectively preserves model order only on trial zero.
+          -- Its FIRST_TRY and SECOND_TRY properties share the same key, so
+          -- clearing SECOND_TRY clears both. Subsequent trials randomize.
+          preserveInitial = modelActive && index == 0
+          bit /\ r1 = JR.nextBoolean acc.random
+          forward = if preserveInitial then true else bit
+          randomized /\ r2 = if preserveInitial then acc.current /\ r1 else randomize forward acc.current r1
+          firstResult =
+            if preserveInitial && countPhysical northSouth acc.current edges == 0 then { current: acc.current, best: acc.current, score: 0, random: r1 }
+            else
+              let
+                swept /\ r3 = sweep relative northSouth cfg constraints (not preserveInitial) forward randomized r2
+              in
+                converge (not forward) swept (countPhysical northSouth swept edges) r3
+        in
+          { current: firstResult.current
+          , best: if firstResult.score < acc.score then firstResult.best else acc.best
+          , score: min acc.score firstResult.score
+          , random: firstResult.random
+          }
+  -- A rejected sweep remains the starting state of the next trial. Only the
+  -- saved best snapshot is restored for transfer to the following processor.
+  converge forward current score random
+    | score == 0 = { current, best: current, score, random }
+    | otherwise =
         let
-          firstAfter /\ secondAfter' =
-            if acc.firstTry then false /\ true else acc.firstTry /\ secondAfter
-        { result: nextResult, firstTry: firstAfter, secondTry: secondAfter' }
-
-  -- ELK: minimizeCrossingsWithCounter.
-  -- 1. forward sweep direction from random.nextBoolean()
-  -- 2. setFirstLayerOrder (randomize barycenters of the first layer)
-  -- 3. sweepReducingCrossings (firstSweep=true)
-  -- 4. while (oldCrossings > newCrossings): flip direction, sweep, recount.
-  minimizeCrossingsWithCounter :: Random -> Boolean -> Boolean -> { layout :: Array (Array NodeId), crossings :: Int, random :: Random }
-  minimizeCrossingsWithCounter r0 firstTry secondTry = do
-    let randomBit /\ r1 = JR.nextBoolean r0
-    -- ELK line 51365: when FIRST_TRY or SECOND_TRY is set AND strategy
-    -- != NONE, the random sweep direction is REPLACED with FIRST_TRY's
-    -- boolean value. The random bit is still consumed (line 51360) so
-    -- the RNG sequence advances identically across iterations.
-    let strategyIsNone = M.isEmpty cfg.modelOrder
-    let useOverride = (firstTry || secondTry) && not strategyIsNone
-    let isForwardSweep = if useOverride then firstTry else randomBit
-    -- When forceNodeModelOrder is on (cfg.modelOrder populated) ELK
-    -- skips setFirstLayerOrder for iters 0/1 (FIRST_TRY/SECOND_TRY take
-    -- the right branch at line 51365). For iter 2+ it calls
-    -- setFirstLayerOrder which randomises the first layer. We
-    -- approximate that here by always skipping when modelOrder is set,
-    -- matching iter 0/1 exactly; iter 2+ behaviour is deferred work.
+          next /\ r = sweep relative northSouth cfg constraints false forward current random
+          nextScore = countPhysical northSouth next edges
+        in
+          if nextScore < score then converge (not forward) next nextScore r
+          else { current: next, best: current, score, random: r }
+  randomize forward current random =
     let
-      randomized /\ r2 =
-        if not strategyIsNone then layers /\ r1
-        else setFirstLayerOrder isForwardSweep layers r1
-    let firstSwept /\ r3 = sweepReducingCrossings randomized isForwardSweep r2
-    let initialCross = countAll firstSwept
-    converge firstSwept (not isForwardSweep) initialCross r3
-    where
-    converge cur dir oldCross r =
-      if oldCross == 0 then { layout: cur, crossings: 0, random: r }
-      else do
-        let cur' /\ r' = sweepReducingCrossings cur dir r
-        let newCross = countAll cur'
-        if newCross < oldCross then converge cur' (not dir) newCross r'
-        else { layout: cur, crossings: oldCross, random: r' }
+      index = if forward then 0 else A.length current.layout - 1
+      first = fromMaybe [] (A.index current.layout index)
+      shuffled /\ r =
+        if A.null cfg.portDummies.dummies then JR.randomShuffle random first
+        else
+          let
+            assign (values /\ rng) node = let key /\ next = JR.nextDouble rng in Cons { node, key } values /\ next
+            keyed /\ next = foldl assign (Nil /\ random) first
+            sorted = A.sortBy (comparing _.key) (A.reverse (A.fromFoldable keyed))
+            ordered = resolveUnits northSouth constraints sorted
+          in
+            ordered /\ next
+      ordered = enforce constraints shuffled
+    in
+      current { layout = fromMaybe current.layout (A.updateAt index ordered current.layout) } /\ r
+  originalCount = A.length (A.filter (\n -> not (isDummy n || isLabelDummy n || M.member n northSouth.dummies)) (A.concat layers))
+  greedyActive = active && originalCount < 40
+  _ /\ afterGreedySeed = JR.nextLongBI trials.random
+  greedyForward /\ afterGreedyDirection = JR.nextBoolean afterGreedySeed
+  final = if not active then initial else if greedyActive then greedy constraints northSouth cfg.ports edges greedyForward trials.best else trials.best
+  finalRandom = if not active then cfg.random else if greedyActive then afterGreedyDirection else trials.random
 
-  -- ELK: BarycenterHeuristic.setFirstLayerOrder. Randomizes the first layer's
-  -- barycenters via `random.nextDouble()` per node, then sorts by barycenter.
-  -- markgraf deviation: only the connected nodes are shuffled; disconnected
-  -- nodes keep their original positions.
-  setFirstLayerOrder :: Boolean -> Array (Array NodeId) -> Random -> Array (Array NodeId) /\ Random
-  setFirstLayerOrder isForwardSweep ls r0 =
-    case A.index ls startIdx of
-      Just first | A.length first > 1 -> do
-        let connected = A.filter isConnected first
-        if A.length connected > 1 then do
-          let shuffled /\ r1 = JR.randomShuffle r0 connected
-          let reassembled = mergeBack first shuffled
-          let withOrder = enforceOrder reassembled
-          fromMaybe (ls /\ r0) (A.updateAt startIdx withOrder ls <#> (_ /\ r1))
-        else ls /\ r0
-      _ -> ls /\ r0
-    where
-    startIdx = if isForwardSweep then 0 else max 0 (A.length ls - 1)
-    isConnected n = S.member n connectedNodes
-    mergeBack original shuffled = _.result $ foldl step { idx: 0, result: [] } original
+-- Node comparisons involving dummies depend on already sorted ports in the
+-- preceding layer. Two insertion-sort passes bracket each layer's port sort.
+preprocess :: Config -> Array Edge -> Order -> Order
+preprocess cfg edges initial
+  | M.isEmpty cfg.modelOrder = initial
+  | otherwise = foldl layer initial (A.mapWithIndex (\i _ -> i) initial.layout)
       where
-      step { idx, result } n =
-        if not (isConnected n) then { idx, result: result <> [ n ] }
-        else case A.index shuffled idx of
-          Just s -> { idx: idx + 1, result: result <> [ s ] }
-          Nothing -> { idx, result: result <> [ n ] }
-
-  -- ELK: sweepReducingCrossings walks layers in the sweep direction, sorting
-  -- each free layer by barycenter relative to the already-fixed reference layer.
-  -- The Random thread runs through every layer's `sortByBarycenter` so the
-  -- per-node jitter (port of ELK `BarycenterHeuristic.calculateBarycenter`'s
-  -- `summedWeight += nextDouble * 0.07 - 0.035`) consumes random bits in
-  -- ELK's order.
-  sweepReducingCrossings :: Array (Array NodeId) -> Boolean -> Random -> Array (Array NodeId) /\ Random
-  sweepReducingCrossings ls forward r0 = foldl step (ls /\ r0) indices
-    where
-    n = A.length ls
-    indices =
-      if forward then A.range 1 (n - 1)
-      else A.reverse (A.range 0 (n - 2))
-
-    step (acc /\ r) i = fromMaybe (acc /\ r) do
-      let refIdx = if forward then i - 1 else i + 1
-      refLayer <- A.index acc refIdx
-      curLayer <- A.index acc i
-      let sorted /\ r' = sortByBarycenter curLayer refLayer forward r
-      let switched = greedySwitch sorted refLayer edges orderConstraintss
-      acc' <- A.updateAt i switched acc
-      pure (acc' /\ r')
-
-  -- Pre-computed once: input-order index of each segment edge in the edges array.
-  -- Used as the sort key for EAST output ports (matches ELK's
-  -- ModelOrderPortComparator behaviour where forward and reversed edges share
-  -- the same comparable space — edge model order — when there is at most one
-  -- edge per source-target pair).
-  edgeIdx :: Map EdgeId Int
-  edgeIdx = M.fromFoldable (A.mapWithIndex (\i e -> e.id /\ i) edges)
-
-  sortByBarycenter :: Array NodeId -> Array NodeId -> Boolean -> Random -> Array NodeId /\ Random
-  sortByBarycenter curLayer refLayer forward r0 = enforceOrder sorted /\ rFinal
-    where
-    refPos = M.fromFoldable (A.mapWithIndex (\i n -> n /\ i) refLayer)
-    freePos = M.fromFoldable (A.mapWithIndex (\i n -> n /\ i) curLayer)
-
-    ranks :: Map EdgeId Number
-    ranks =
-      if forward then outputRanks refLayer refPos freePos edges edgeIdx
-      else inputRanks refLayer refPos freePos edges edgeIdx
-
-    -- Port of ELK `BarycenterHeuristic.calculateBarycenters`: walks nodes in
-    -- layer order and consumes one `next 24` per node WITH neighbours.
-    -- The jitter is added to the summed weight before division by degree so
-    -- the effective barycenter shifts by ±0.035/degree per call. Matches
-    -- elkjs line 50369: `summedWeight += nextInternal(24) / 2^24 * 0.07 - 0.035`.
-    barysAndRandom = foldl stepBary { items: [], r: r0 } (A.mapWithIndex (/\) curLayer)
-    stepBary acc (i /\ n) = do
-      let
-        connecting =
-          if forward then A.filter
-            ( \e -> e.to.node == n
-                && M.member (e.from.node) refPos
+      edgeOrder = M.fromFoldable (A.mapWithIndex (\i e -> e.id /\ i) edges)
+      chainOrder = M.fromFoldable
+        ( A.concat
+            ( A.mapWithIndex
+                ( \i chain ->
+                    A.mapMaybe
+                      ( \e ->
+                          if belongs chain e then Just (e.id /\ i)
+                          else Nothing
+                      )
+                      edges
+                )
+                cfg.chains
             )
-            edges
-          else A.filter
-            ( \e -> e.from.node == n
-                && M.member (e.to.node) refPos
+        )
+      modelEdge e = fromMaybe (fromMaybe 0 (M.lookup e.id edgeOrder)) (M.lookup e.id chainOrder)
+      target e = fromMaybe e.to.node do
+        chain <- A.find (\c -> belongs c e) cfg.chains
+        A.last chain.nodes
+      belongs chain e = chain.edgeId == e.id ||
+        ( A.length chain.nodes > 2
+            && A.any (\(a /\ b) -> e.id == EdgeId (un EdgeId chain.edgeId <> ":" <> un NodeId a <> "->" <> un NodeId b))
+              (A.zip chain.nodes (A.drop 1 chain.nodes))
+        )
+      reversedSegments = S.fromFoldable
+        ( map _.id
+            ( A.filter
+                (\e -> S.member e.id cfg.reversed || A.any (\c -> S.member c.edgeId cfg.reversed && belongs c e) cfg.chains)
+                edges
             )
-            edges
-      let rs = A.mapMaybe (\e -> M.lookup e.id ranks) connecting
-      if A.null rs then acc { items = acc.items <> [ { n, key: Nothing, origIdx: i } ] }
-      else do
-        let bits /\ r' = JR.next 24 acc.r
-        -- ELK line 50369 uses Java float constants `0.07f`/`0.035f`
-        -- which promote to the doubles `0.07000000029802322` /
-        -- `0.03500000014901161`. Using ordinary `0.07`/`0.035` doubles
-        -- introduces a 1e-10 jitter delta that flips exact-tie sort
-        -- decisions. intern_81 = 1/2^24 = 5.9604644775390625E-8.
-        let jitter = Int.toNumber bits * 5.9604644775390625e-8 * 0.07000000029802322 - 0.03500000014901161
-        let key = (sum rs + jitter) / toNumber (A.length rs)
-        { items: acc.items <> [ { n, key: Just key, origIdx: i } ], r: r' }
+        )
+      layer acc index =
+        let
+          previous = fromMaybe [] (A.index acc.layout (index - 1))
+          nodes = fromMaybe [] (A.index acc.layout index)
+          compareNodes ports a b = case M.lookup a cfg.modelOrder /\ M.lookup b cfg.modelOrder of
+            Just x /\ Just y -> compare x y
+            _ -> case incoming ports previous a /\ incoming ports previous b of
+              Just x /\ Just y -> case compare (A.elemIndex x.from.node previous) (A.elemIndex y.from.node previous) of
+                EQ -> compare (portRank ports x South) (portRank ports y South)
+                result -> result
+              Just x /\ Nothing -> compare (modelEdge x) 2147483647
+              Nothing /\ Just y -> compare 2147483647 (modelEdge y)
+              _ -> EQ
+          first = modelSort (compareNodes acc.ports) nodes
+          sortedPorts = foldl (sortPorts previous) acc.ports first
+          second = modelSort (compareNodes sortedPorts) first
+        in
+          { layout: fromMaybe acc.layout (A.updateAt index second acc.layout), ports: sortedPorts }
+      incoming ports previous node = A.find (\e -> A.elem e.from.node previous)
+        (A.concatMap _.edges (A.reverse (P.groups node North ports)))
+      portRank ports e side = fromMaybe 0
+        ( A.findIndex (A.any (\other -> other.id == e.id) <<< _.edges)
+            (P.groups (if side == South then e.from.node else e.to.node) side ports)
+        )
+      sortPorts previous ports node = foldl (sortSide previous node) ports [ South, North ]
+      sortSide previous node ports side =
+        let
+          ps = P.groups node side ports
+          groupMinimum p = fromMaybe 0 do
+            e <- A.head p.edges
+            let matching = A.filter (\other -> target other == target e && not (S.member other.id reversedSegments)) (A.concatMap _.edges ps)
+            pure (fromMaybe (modelEdge e) (minimum (map modelEdge matching)))
+          compareOut a b = case compare (groupMinimum a) (groupMinimum b) of
+            EQ -> compare (map modelEdge (A.head a.edges)) (map modelEdge (A.head b.edges))
+            result -> result
+          compareIn a b = case A.head a.edges /\ A.head b.edges of
+            Just x /\ Just y -> case compare (A.elemIndex x.from.node previous) (A.elemIndex y.from.node previous) of
+              EQ -> compare (portRank ports x South) (portRank ports y South)
+              result -> result
+            _ -> EQ
+          sorted = if P.fixed cfg.ports node then ps else A.sortBy (if side == South then compareOut else compareIn) ps
+        in
+          P.reorder node side sorted ports
 
-    raw = barysAndRandom.items
-    rFinal = barysAndRandom.r
-    filled = fillInUnknownBarycenters raw
-
-    -- ELK's plain `BarycenterHeuristic` sort: a pure-barycenter compare
-    -- under GWT's `Collections.sort` (stable merge sort). Model order is
-    -- not a tiebreak here — it is established earlier by layer seeding.
-    sorted = collectionsSortBarycenter filled <#> _.n
-
-  -- Port of `BarycenterHeuristic.fillInUnknownBarycenters` (preOrdered branch).
-  -- Walks the layer in current order; for each node whose barycenter is
-  -- undefined, assigns (lastDefined + nextDefined) / 2, where nextDefined
-  -- is the next node with a defined barycenter (or lastDefined+1 if none).
-  -- Without this, nodes with no neighbours in the reference layer would all
-  -- get barycenter 0 and clump at the front.
-  fillInUnknownBarycenters
-    :: Array { n :: NodeId, key :: Maybe Number, origIdx :: Int }
-    -> Array { n :: NodeId, key :: Number, origIdx :: Int }
-  fillInUnknownBarycenters nodes = walk 0 (-1.0) []
-    where
-    walk i lastValue acc = case A.index nodes i of
-      Nothing -> acc
-      Just node -> case node.key of
-        Just k ->
-          walk (i + 1) k (acc <> [ { n: node.n, key: k, origIdx: node.origIdx } ])
-        Nothing -> do
-          let nextV = nextDefined (i + 1) (lastValue + 1.0)
-          let v = (lastValue + nextV) / 2.0
-          walk (i + 1) v (acc <> [ { n: node.n, key: v, origIdx: node.origIdx } ])
-
-    nextDefined startIdx fallback = case A.index nodes startIdx of
-      Nothing -> fallback
-      Just node -> case node.key of
-        Just k -> k
-        Nothing -> nextDefined (startIdx + 1) fallback
-
-  enforceOrder :: Array NodeId -> Array NodeId
-  enforceOrder layer = foldl applyOne layer orderConstraintss
-    where
-    applyOne arr { before, after } = case A.elemIndex before arr /\ A.elemIndex after arr of
-      Just bi /\ Just ai | bi > ai -> do
-        let without = fromMaybe arr (A.deleteAt bi arr)
-        fromMaybe without (A.insertAt ai before without)
-      _ -> arr
-
-  countAll :: Array (Array NodeId) -> Int
-  countAll ls = countAllCrossings ls edges
-
--- ── crossing-minimization sort ────────────────────────────────────
--- markgraf ships ELK's soft `considerModelOrder` (d2's default). ELK then
--- uses the plain `BarycenterHeuristic` (LayerSweepGraphOrderingProcessor):
--- a stateless pure-barycenter compare under `Collections.sort` (a stable
--- merge sort). Model order is NOT a sort tiebreak; it is established
--- earlier by `SortByInputModelProcessor` seeding the layer in declaration
--- order. (forceNodeModelOrder / the stateful `ModelOrderBarycenterHeuristic`
--- is not implemented — markgraf never pins authored order.)
-
--- | A single node awaiting placement in its layer, with its (already
--- | filled-in) barycenter value.
-type BaryNode = { n :: NodeId, key :: Number, origIdx :: Int }
-
--- | Port of the plain `BarycenterHeuristic` soft sort: `Collections.sort`
--- | over the STATELESS pure-barycenter comparator. The comparator is
--- | `BarycenterState.barycenter.compareTo` (both values are defined after
--- | `fillInUnknownBarycenters`), so this reduces to comparing the filled-in
--- | keys. The sort itself reproduces the exact stable merge sort GWT compiles
--- | `Collections.sort` to (elk-worker.js `mergeSort_0`): runs shorter than 7
--- | use a swap-based insertion sort, larger runs split at the midpoint,
--- | recurse, and merge with a `<= 0` stability bias. Model order is absent
--- | here — ELK enforces it upstream, never as a barycenter tiebreak.
-collectionsSortBarycenter :: Array BaryNode -> Array BaryNode
-collectionsSortBarycenter = mergeSort
+-- ELK remembers each model-order comparison transitively; its mixed
+-- node/edge comparator is not a global scalar key.
+modelSort :: (NodeId -> NodeId -> Ordering) -> Array NodeId -> Array NodeId
+modelSort cmp nodes = (foldl insert { nodes: [], before: M.empty } nodes).nodes
   where
-  cmp a b = compare a.key b.key
-
-  mergeSort arr
-    | A.length arr < 7 = insertionRun arr
-    | otherwise = do
-        let mid = A.length arr / 2
-        let left = mergeSort (A.slice 0 mid arr)
-        let right = mergeSort (A.slice mid (A.length arr) arr)
-        merge left right
-
-  -- GWT `insertionSort` (the run-level one): swap-based, walks each element
-  -- left while the predecessor compares greater.
-  insertionRun arr0 = foldl outer arr0 (A.range 1 (A.length arr0 - 1))
+  insert acc node = walk acc (A.length acc.nodes - 1)
     where
-    outer arr i = inner arr i
-    inner arr j = case A.index arr (j - 1) /\ A.index arr j of
-      Just prev /\ Just here | j > 0 ->
-        case cmp prev here of
-          GT -> case swap (j - 1) j arr of
-            Just arr' -> inner arr' (j - 1)
-            Nothing -> arr
-          _ -> arr
-      _ -> arr
+    place current index = current { nodes = fromMaybe current.nodes (A.insertAt (index + 1) node current.nodes) }
+    walk current index = case A.index current.nodes index of
+      Nothing -> place current index
+      Just other ->
+        let
+          known a b = S.member b (fromMaybe S.empty (M.lookup a current.before))
+          result = if known other node then LT else if known node other then GT else cmp other node
+          smaller = if result == GT then node else other
+          bigger = if result == GT then other else node
+          successors = S.insert bigger (fromMaybe S.empty (M.lookup bigger current.before))
+          predecessors = S.insert smaller
+            ( S.fromFoldable
+                ( A.mapMaybe (\(n /\ ns) -> if S.member smaller ns then Just n else Nothing)
+                    (M.toUnfoldable current.before :: Array (NodeId /\ S.Set NodeId))
+                )
+            )
+          before = foldl (\m n -> M.insertWith S.union n successors m) current.before predecessors
+          next = current { before = before }
+        in
+          if result == GT then walk next (index - 1)
+          else place next index
 
-  -- GWT `merge`: stable two-way merge, taking the left element while
-  -- `compare(left, right) <= 0`.
-  merge left right = go [] 0 0
-    where
-    go acc i j = case A.index left i /\ A.index right j of
-      Just l /\ Just rr ->
-        case cmp l rr of
-          GT -> go (A.snoc acc rr) i (j + 1)
-          _ -> go (A.snoc acc l) (i + 1) j
-      Just _ /\ Nothing -> acc <> A.drop i left
-      Nothing /\ _ -> acc <> A.drop j right
+sweep :: Boolean -> NS.Metadata -> Config -> Array { before :: NodeId, after :: NodeId } -> Boolean -> Boolean -> Order -> Random -> Order /\ Random
+sweep relative northSouth cfg constraints firstSweep forward initial random = foldl step (initial /\ random) indices
+  where
+  indices = if forward then A.mapWithIndex (\i _ -> i) initial.layout else A.reverse (A.mapWithIndex (\i _ -> i) initial.layout)
+  start = if forward then 0 else A.length initial.layout - 1
+  side = if forward then North else South
+  opposite = if forward then South else North
+  step (state /\ r) index
+    | index == start = state /\ r
+    | otherwise =
+        let
+          reference = fromMaybe [] (A.index state.layout (index + if forward then -1 else 1))
+          free = fromMaybe [] (A.index state.layout index)
+          ranks = P.ranks relative reference opposite state.ports
+          sorted /\ r1 = barycenters northSouth state.ports ranks constraints (not firstSweep) forward free r
+          ports1 = P.distribute cfg.ports sorted side ranks state.ports
+          reverseRanks = P.ranks relative sorted side ports1
+          ports2 = P.distribute cfg.ports reference opposite reverseRanks ports1
+        in
+          { layout: fromMaybe state.layout (A.updateAt index sorted state.layout), ports: ports2 } /\ r1
+
+barycenters :: NS.Metadata -> Ports -> Map EdgeId Number -> Array { before :: NodeId, after :: NodeId } -> Boolean -> Boolean -> Array NodeId -> Random -> Array NodeId /\ Random
+barycenters northSouth ports ranks constraints preOrdered forward nodes random = ordered /\ filled.random
+  where
+  computed = foldl (\acc node -> calculate S.empty node acc) { states: M.empty, random } nodes
+  ordered =
+    if M.isEmpty northSouth.dummies then enforce constraints (map _.node sorted)
+    else resolveUnits northSouth constraints sorted
+  calculate visiting node acc
+    | M.member node acc.states || S.member node visiting = acc
+    | otherwise =
+        let
+          nextVisiting = S.insert node visiting
+          nodePorts = P.groups node (if forward then North else South) ports
+          connecting = A.concatMap _.edges (if forward then A.reverse nodePorts else nodePorts)
+          aggregateEdges = foldl
+            ( \state e ->
+                let
+                  other = if forward then e.from.node else e.to.node
+                in
+                  if A.elem other nodes then
+                    let
+                      rec = calculate nextVisiting other { states: state.states, random: state.random }
+                      dependency = fromMaybe { node: other, weight: 0.0, degree: 0, value: Nothing } (M.lookup other rec.states)
+                    in
+                      state { states = rec.states, random = rec.random, weight = state.weight + dependency.weight, degree = state.degree + dependency.degree }
+                  else case M.lookup e.id ranks of
+                    Just rank -> state { weight = state.weight + rank, degree = state.degree + 1 }
+                    Nothing -> state
+            )
+            { states: acc.states, random: acc.random, weight: 0.0, degree: 0 }
+            connecting
+          aggregate = foldl
+            ( \state other ->
+                if not (A.elem other nodes) then state
+                else
+                  let
+                    rec = calculate nextVisiting other { states: state.states, random: state.random }
+                    dependency = fromMaybe { node: other, weight: 0.0, degree: 0, value: Nothing } (M.lookup other rec.states)
+                  in
+                    state { states = rec.states, random = rec.random, weight = state.weight + dependency.weight, degree = state.degree + dependency.degree }
+            )
+            aggregateEdges
+            (NS.associates northSouth node)
+          bits /\ r = if aggregate.degree > 0 then JR.next 24 aggregate.random else 0 /\ aggregate.random
+          weight = aggregate.weight + if aggregate.degree > 0 then toNumber bits * 5.9604644775390625e-8 * 0.07000000029802322 - 0.03500000014901161 else 0.0
+          value = if aggregate.degree > 0 then Just (weight / toNumber aggregate.degree) else Nothing
+          bary = { node, weight, degree: aggregate.degree, value }
+        in
+          { states: M.insert node bary aggregate.states, random: r }
+  raw = A.mapMaybe (\node -> M.lookup node computed.states) nodes
+  maximum = 2.0 + foldl (\m b -> max m (fromMaybe 0.0 b.value)) 0.0 raw
+  filled = foldl fill { nodes: [], last: -1.0, random: computed.random } (A.mapWithIndex (/\) raw)
+  fill acc (index /\ bary) = case bary.value of
+    Just value -> acc { nodes = A.snoc acc.nodes { node: bary.node, key: value }, last = value }
+    Nothing ->
+      let
+        next = fromMaybe (acc.last + 1.0) (A.head (A.mapMaybe _.value (A.drop (index + 1) raw)))
+        bits /\ r = if preOrdered then 0 /\ acc.random else JR.next 24 acc.random
+        value = if preOrdered then (acc.last + next) / 2.0 else toNumber bits * 5.9604644775390625e-8 * maximum - 1.0
+      in
+        { nodes: A.snoc acc.nodes { node: bary.node, key: value }, last: value, random: r }
+  sorted = A.sortBy (comparing _.key) filled.nodes
+
+-- Forster resolves normal-node precedence first. Only then can layout-unit
+-- precedence be derived without introducing constraints in the opposite order.
+resolveUnits :: NS.Metadata -> Array { before :: NodeId, after :: NodeId } -> Array { node :: NodeId, key :: Number } -> Array NodeId
+resolveUnits northSouth constraints values = map _.node
+  (ConstraintGroups.resolve (constraints <> NS.constraints northSouth (map _.node first)) first)
+  where
+  normal node = not (isDummy node || isLabelDummy node || M.member node northSouth.dummies)
+  betweenNormals = A.filter (\c -> normal c.before && normal c.after) constraints
+  first = if A.null betweenNormals then values else ConstraintGroups.resolve betweenNormals values
+
+-- Explicit constraints are hard precedence, not a barycenter tie breaker.
+-- A stable topological selection handles transitive constraints in one pass.
+enforce :: Array { before :: NodeId, after :: NodeId } -> Array NodeId -> Array NodeId
+enforce constraints = go []
+  where
+  go done remaining
+    | A.null remaining = done
+    | otherwise = case A.findIndex (\node -> not (A.any (\c -> c.after == node && A.elem c.before remaining) constraints)) remaining of
+        Nothing -> done <> remaining
+        Just index -> case A.index remaining index /\ A.deleteAt index remaining of
+          Just node /\ Just rest -> go (A.snoc done node) rest
+          _ -> done <> remaining
+
+countPhysical :: NS.Metadata -> Order -> Array Edge -> Int
+countPhysical northSouth state edges = countWith hyperedgeCrossings state edges
+  + NS.crossings northSouth state.ports state.layout
+
+countStraight :: Order -> Array Edge -> Int
+countStraight = countWith inversions
+
+countWith :: (Array (Number /\ Number) -> Int) -> Order -> Array Edge -> Int
+countWith counter state edges = foldl pair 0 (A.zip state.layout (A.drop 1 state.layout))
+  where
+  pair acc (left /\ right) =
+    let
+      a = P.ranks false left South state.ports
+      b = P.ranks false right North state.ports
+      endpoints = A.mapMaybe (\e -> (/\) <$> M.lookup e.id a <*> M.lookup e.id b) edges
+    in
+      acc + counter endpoints
+
+-- ELK HyperedgeCrossingsCounter: connected physical endpoints form one
+-- hyperedge. Count inversions of its upper corners, then overlapping spans
+-- on either side. Singleton hyperedges reduce to ordinary edge inversions.
+hyperedgeCrossings :: Array (Number /\ Number) -> Int
+hyperedgeCrossings endpoints = inversions (map (\b -> b.leftLo /\ b.rightLo) bounds)
+  + overlaps _.leftLo _.leftHi
+  + overlaps _.rightLo _.rightHi
+  where
+  components = foldl join [] endpoints
+  join current (left /\ right) =
+    let
+      touches c = S.member left c.left || S.member right c.right
+      matching = A.filter touches current
+      merged = foldl (\c other -> { left: S.union c.left other.left, right: S.union c.right other.right })
+        { left: S.singleton left, right: S.singleton right }
+        matching
+    in
+      A.snoc (A.filter (not <<< touches) current) merged
+  bounds = map
+    ( \c ->
+        { leftLo: fromMaybe 0.0 (S.findMin c.left)
+        , leftHi: fromMaybe 0.0 (S.findMax c.left)
+        , rightLo: fromMaybe 0.0 (S.findMin c.right)
+        , rightHi: fromMaybe 0.0 (S.findMax c.right)
+        }
+    )
+    components
+  overlaps lo hi = foldl (\n (i /\ a) -> n + A.length (A.filter (\b -> lo a < hi b && lo b < hi a) (A.drop (i + 1) bounds)))
+    0
+    (A.mapWithIndex (/\) bounds)
+
+inversions :: Array (Number /\ Number) -> Int
+inversions pairs = foldl (\count (i /\ (a /\ b)) -> count + A.length (A.filter (\(c /\ d) -> (a - c) * (b - d) < 0.0) (A.drop (i + 1) pairs)))
+  0
+  (A.mapWithIndex (/\) pairs)
+
+-- Public node-only metric retained for callers measuring layer permutations.
+-- The minimizer itself always counts ordered physical endpoints.
+countCrossings :: Array NodeId -> Array NodeId -> Array Edge -> Int
+countCrossings left right edges = inversions (A.mapMaybe endpoint edges)
+  where
+  endpoint e = case A.elemIndex e.from.node left /\ A.elemIndex e.to.node right of
+    Just a /\ Just b -> Just (toNumber a /\ toNumber b)
+    _ -> case A.elemIndex e.to.node left /\ A.elemIndex e.from.node right of
+      Just a /\ Just b -> Just (toNumber a /\ toNumber b)
+      _ -> Nothing
+
+countAllCrossings :: Array (Array NodeId) -> Array Edge -> Int
+countAllCrossings layers edges = sum (map (\(a /\ b) -> countCrossings a b edges) (A.zip layers (A.drop 1 layers)))
+
+-- This is a separate two-sided processor, never an in-sweep barycenter
+-- refinement. Ports are switched only on strict improvement, preserving ties.
+greedy :: Array { before :: NodeId, after :: NodeId } -> NS.Metadata -> Map NodeId (Array Port) -> Array Edge -> Boolean -> Order -> Order
+greedy constraints northSouth declared edges = loop
+  where
+  loop forward state =
+    let
+      indices = A.mapWithIndex (\i _ -> i) state.layout
+      next = foldl (visit forward) state (if forward then indices else A.reverse indices)
+    in
+      if next == state then state else loop (not forward) next
+  visit forward state index =
+    let
+      start = if forward then 0 else A.length state.layout - 1
+      switched = if index == start then sweepNodes index state else repeatNodes index state
+      layer = fromMaybe [] (A.index switched.layout index)
+      side = if forward then North else South
+    in
+      foldl (switchPorts side) switched layer
+  sweepNodes index state =
+    let
+      layer = fromMaybe [] (A.index state.layout index)
+    in
+      foldl (switchNode index) state (A.mapWithIndex (\i _ -> i) (A.drop 1 layer))
+  repeatNodes index state =
+    let
+      next = sweepNodes index state
+    in
+      if next == state then state else repeatNodes index next
+  switchNode index state position = fromMaybe state do
+    layer <- A.index state.layout index
+    a <- A.index layer position
+    b <- A.index layer (position + 1)
+    if A.any (\c -> c.before == a && c.after == b) constraints || NS.preventsSwitch northSouth a b then pure state
+    else do
+      changed <- swap position (position + 1) layer
+      layout <- A.updateAt index changed state.layout
+      let next = state { layout = layout }
+      let local = NS.neighboringCrossings northSouth state.ports a b
+      pure (if countStraight next edges + local.after < countStraight state edges + local.before then next else state)
+  switchPorts side state node
+    | P.fixed declared node = state
+    | otherwise =
+        let
+          ps = P.groups node side state.ports
+          next = foldl
+            ( \cur index -> fromMaybe cur do
+                changed <- swap index (index + 1) (P.groups node side cur.ports)
+                let candidate = cur { ports = P.reorder node side changed cur.ports }
+                pure (if countStraight candidate edges < countStraight cur edges then candidate else cur)
+            )
+            state
+            (A.mapWithIndex (\i _ -> i) (A.drop 1 ps))
+        in
+          if next == state then state else switchPorts side next node
 
 swap :: forall a. Int -> Int -> Array a -> Maybe (Array a)
-swap i j arr = do
-  vi <- A.index arr i
-  vj <- A.index arr j
-  arr' <- A.updateAt i vj arr
-  A.updateAt j vi arr'
-
--- | Port of `LayerTotalPortDistributor.calculatePortRanks` for OUTPUT ports
--- | (elk-worker.js:51770).
--- |
--- | Walks ref-layer nodes in position order, accumulating `consumedRank`
--- | across the layer. Within each node, output edges are sorted by edge
--- | model order; the j-th edge gets integer rank `consumedRank + (j+1)`.
--- | After processing a node, `consumedRank += k`. Edges to/from other
--- | layers are excluded.
--- |
--- | ELK chooses between this and `NodeRelativePortDistributor` (fractional
--- | ranks) via a single RNG bit consumed during `GraphInfoHolder`
--- | construction (`create_14`, elk-worker.js:50103). For seed=1 the bit
--- | lands on 0 → LayerTotal. We hardcode LayerTotal because that's what
--- | ELK picks under our fixed seed configuration.
-outputRanks
-  :: Array NodeId
-  -> Map NodeId Int
-  -> Map NodeId Int
-  -> Array Edge
-  -> Map EdgeId Int
-  -> Map EdgeId Number
-outputRanks refLayer _refPos freePos edges edgeIdx =
-  M.fromFoldable (foldl perNode { ranks: [], rankSum: 0 } refLayer).ranks
-  where
-  perNode acc nodeId = do
-    let outE = A.filter inFree (A.filter (originatesAt nodeId) edges)
-    let sorted = A.sortBy (\a b -> compare (keyOf a) (keyOf b)) outE
-    let k = A.length sorted
-    let
-      newRanks = A.mapWithIndex
-        (\j e -> e.id /\ toNumber (acc.rankSum + j + 1))
-        sorted
-    { ranks: acc.ranks <> newRanks, rankSum: acc.rankSum + k }
-
-  inFree e = M.member (e.to.node) freePos
-  originatesAt n e = e.from.node == n
-  keyOf e = fromMaybe 1000000 (M.lookup e.id edgeIdx)
-
--- | Port of `LayerTotalPortDistributor.calculatePortRanks` for INPUT ports
--- | (elk-worker.js:51743).
--- |
--- | Walks ref-layer nodes in position order, accumulating `consumedRank`.
--- | Within each node, input edges are iterated in west-side CCW order
--- | (top-to-bottom = source-position descending in our flat-port case);
--- | the first iterated port (top, from highest-positioned source) gets
--- | rank `consumedRank + inputCount`, the next gets `consumedRank +
--- | inputCount - 1`, …, the last gets `consumedRank + 1`. After the
--- | node, `consumedRank += inputCount`.
-inputRanks
-  :: Array NodeId
-  -> Map NodeId Int
-  -> Map NodeId Int
-  -> Array Edge
-  -> Map EdgeId Int
-  -> Map EdgeId Number
-inputRanks refLayer _refPos freePos edges edgeIdx =
-  M.fromFoldable (foldl perNode { ranks: [], rankSum: 0 } refLayer).ranks
-  where
-  perNode acc nodeId = do
-    let inE = A.filter inFree (A.filter (terminatesAt nodeId) edges)
-    let sorted = A.sortBy compareDesc inE
-    let k = A.length sorted
-    let
-      newRanks = A.mapWithIndex
-        (\j e -> e.id /\ toNumber (acc.rankSum + k - j))
-        sorted
-    { ranks: acc.ranks <> newRanks, rankSum: acc.rankSum + k }
-
-  inFree e = M.member (e.from.node) freePos
-  terminatesAt n e = e.to.node == n
-  sourcePosOf e = fromMaybe (-1) (M.lookup (e.from.node) freePos)
-  keyOf e = fromMaybe 1000000 (M.lookup e.id edgeIdx)
-  compareDesc a b = case compare (sourcePosOf b) (sourcePosOf a) of
-    EQ -> compare (keyOf a) (keyOf b)
-    other -> other
-
-orderConstraintsOf :: Array Constraints -> Array { before :: NodeId, after :: NodeId }
-orderConstraintsOf = A.mapMaybe case _ of
-  OrderConstraint r -> Just { before: r.before, after: r.after }
-  _ -> Nothing
-
--- | Total crossings across all adjacent layer pairs.
--- | ELK: GraphInfoHolder.crossCounter().countAllCrossings(currentNodeOrder).
-countAllCrossings :: Array (Array NodeId) -> Array Edge -> Int
-countAllCrossings layers edges = foldl addPair 0 (A.range 0 (A.length layers - 2))
-  where
-  addPair total i = fromMaybe total do
-    a <- A.index layers i
-    b <- A.index layers (i + 1)
-    pure (total + countCrossings a b edges)
-
-countCrossings :: Array NodeId -> Array NodeId -> Array Edge -> Int
-countCrossings layer1 layer2 edges = do
-  let posA = M.fromFoldable (A.mapWithIndex (\i n -> n /\ i) layer1)
-  let posB = M.fromFoldable (A.mapWithIndex (\i n -> n /\ i) layer2)
-  let
-    relevant = A.mapMaybe
-      ( \e ->
-          case M.lookup (e.from.node) posA /\ M.lookup (e.to.node) posB of
-            Just u /\ Just v -> Just (u /\ v)
-            _ -> case M.lookup (e.from.node) posB /\ M.lookup (e.to.node) posA of
-              Just v /\ Just u -> Just (u /\ v)
-              _ -> Nothing
-      )
-      edges
-  countPairs relevant
-  where
-  countPairs pairs = do
-    let n = A.length pairs
-    foldl
-      ( \acc i ->
-          foldl
-            ( \acc2 j -> case A.index pairs i /\ A.index pairs j of
-                Just (u1 /\ v1) /\ Just (u2 /\ v2) ->
-                  if (u1 - u2) * (v1 - v2) < 0 then acc2 + 1 else acc2
-                _ -> acc2
-            )
-            acc
-            (A.range (i + 1) (n - 1))
-      )
-      0
-      (A.range 0 (n - 2))
-
--- | Port of `GreedySwitchHeuristic` (ONE_SIDED) from
--- | `intermediate.greedyswitch.GreedySwitchHeuristic.java`.
--- |
--- | `sweepDownwardInLayer`: walks adjacent pairs (i, i+1) of the free layer
--- | and switches if doing so reduces crossings against the fixed reference
--- | layer. `continueSwitchingUntilNoImprovementInLayer` repeats sweeps until
--- | a full pass makes no swap.
--- |
--- | Used here as a refinement applied after the barycenter sort within each
--- | layer step, matching the typical post-barycenter cleanup pattern. ELK
--- | proper invokes ONE_SIDED greedy switch as an alternative crossMinType in
--- | `LayerSweepCrossingMinimizer`; combining it with barycenter is strictly
--- | non-worsening since switches are gated on a reduced crossing count.
-greedySwitch
-  :: Array NodeId
-  -> Array NodeId
-  -> Array Edge
-  -> Array { before :: NodeId, after :: NodeId }
-  -> Array NodeId
-greedySwitch layer refLayer edges orderConstraintss = continueSwitching layer
-  where
-  continueSwitching cur = do
-    let next = sweepDownward cur 0
-    if next == cur then cur
-    else continueSwitching next
-
-  sweepDownward cur upperIdx
-    | upperIdx >= A.length cur - 1 = cur
-    | otherwise = case A.index cur upperIdx /\ A.index cur (upperIdx + 1) of
-        Just a /\ Just b ->
-          if violatesOrder a b then sweepDownward cur (upperIdx + 1)
-          else do
-            let
-              swapped = fromMaybe cur do
-                s1 <- A.updateAt upperIdx b cur
-                A.updateAt (upperIdx + 1) a s1
-            if doesSwitchReduceCrossings cur swapped then sweepDownward swapped (upperIdx + 1)
-            else sweepDownward cur (upperIdx + 1)
-        _ -> cur
-
-  doesSwitchReduceCrossings cur swapped =
-    countCrossings refLayer swapped edges < countCrossings refLayer cur edges
-
-  violatesOrder before after = A.any (\c -> c.before == before && c.after == after) orderConstraintss
-
+swap i j values = do
+  a <- A.index values i
+  b <- A.index values j
+  first <- A.updateAt i b values
+  A.updateAt j a first

@@ -1,3 +1,9 @@
+-- Copyright (c) 2016 Kiel University and others.
+-- SPDX-License-Identifier: EPL-2.0
+-- Translated from ELK c831ba4613dfd6b0055851193956560351d2f907:
+-- NetworkSimplex.initialize, feasibleTree, tightTreeDFS, leaveEdge,
+-- exchange, and reattachSubtrees; NNode.getConnectedEdges.
+--
 -- | Generic Gansner-Koutsofios-North-Vo network simplex algorithm,
 -- | shared between layer assignment and the post-routing graph
 -- | compactor.
@@ -11,8 +17,7 @@
 -- | `fuzzyStZero` to track ELK's tolerance for floating-point
 -- | imprecision.
 -- |
--- | Connected-component splitting, layer balancing, and disconnected
--- | component stacking are left to callers — they are layering-specific.
+-- | Connected-component splitting and layer balancing are left to callers.
 module LayeredLayout.NetworkSimplex
   ( NEdge
   , runNetworkSimplex
@@ -56,6 +61,8 @@ type NSState n =
   { layer :: Map n Int
   , treeNode :: Set n
   , treeEdge :: Set Int
+  , treeOrder :: Array (NEdge n)
+  , connected :: Map n (Array (NEdge n))
   , poID :: Map n Int
   , lowestPoID :: Map n Int
   , cutvalue :: Map Int Number
@@ -92,13 +99,15 @@ runNetworkSimplex nodes edges
 -- | Run the simplex on a graph without leaf-pruning and without
 -- | normalising. The caller normalises after any reattach.
 runSimplexCore :: forall n. Ord n => Array n -> Array (NEdge n) -> Map n Int
-runSimplexCore nodes edges = do
-  let st0 = initialState nodes
+runSimplexCore nodes inputEdges = do
+  let outgoing = byNode _.src inputEdges
+  let edges = nodes >>= \node -> fromMaybe [] (M.lookup node outgoing)
+  let st0 = initialState nodes inputEdges
   let st1 = layeringTopological nodes edges st0
   if A.null edges then st1.layer
   else do
     let st2 = feasibleTree nodes edges st1
-    let iterLimit = 4 * A.length nodes
+    let iterLimit = top :: Int
     let st3 = optimiseLoop iterLimit nodes edges st2
     st3.layer
 
@@ -111,7 +120,7 @@ removeSubtrees
   -> Array (NEdge n)
   -> { coreNodes :: Array n
      , coreEdges :: Array (NEdge n)
-     , removed :: Array { node :: n, neighbour :: n, viaSrc :: Boolean }
+     , removed :: Array { node :: n, neighbour :: n, viaSrc :: Boolean, delta :: Int }
      }
 removeSubtrees nodes edges = do
   let
@@ -125,7 +134,7 @@ removeSubtrees nodes edges = do
       { degree: degree0
       , removedNodes: S.empty
       , removedEdges: S.empty
-      , record: ([] :: Array { node :: n, neighbour :: n, viaSrc :: Boolean })
+      , record: ([] :: Array { node :: n, neighbour :: n, viaSrc :: Boolean, delta :: Int })
       , queue: initialLeaves
       }
   { coreNodes: A.filter (\n -> not (S.member n drained.removedNodes)) nodes
@@ -147,7 +156,7 @@ removeSubtrees nodes edges = do
               { degree = M.insert neighbour ((fromMaybe 0 (M.lookup neighbour st.degree)) - 1) st.degree
               , removedNodes = S.insert leaf st.removedNodes
               , removedEdges = S.insert edge.eid st.removedEdges
-              , record = st.record <> [ { node: leaf, neighbour, viaSrc } ]
+              , record = st.record <> [ { node: leaf, neighbour, viaSrc, delta: edge.delta } ]
               , queue = rest
               }
           let nDeg = fromMaybe 0 (M.lookup neighbour st'.degree)
@@ -163,29 +172,37 @@ removeSubtrees nodes edges = do
 reattachSubtrees
   :: forall n
    . Ord n
-  => Array { node :: n, neighbour :: n, viaSrc :: Boolean }
+  => Array { node :: n, neighbour :: n, viaSrc :: Boolean, delta :: Int }
   -> Map n Int
   -> Map n Int
 reattachSubtrees record coreLayer = foldl step coreLayer (A.reverse record)
   where
   step layers r = do
     let neighbourLayer = fromMaybe 0 (M.lookup r.neighbour layers)
-    let myLayer = if r.viaSrc then neighbourLayer - 1 else neighbourLayer + 1
+    let myLayer = if r.viaSrc then neighbourLayer - r.delta else neighbourLayer + r.delta
     M.insert r.node myLayer layers
 
 -- ── Initial state + topological layering ───────────────────────────
 
-initialState :: forall n. Ord n => Array n -> NSState n
-initialState nodes =
+initialState :: forall n. Ord n => Array n -> Array (NEdge n) -> NSState n
+initialState nodes edges =
   { layer: M.fromFoldable (nodes <#> \n -> n /\ 0)
   , treeNode: S.empty
   , treeEdge: S.empty
+  , treeOrder: []
+  , connected: M.fromFoldable
+      ( nodes <#> \node ->
+          node /\ (fromMaybe [] (M.lookup node incoming) <> fromMaybe [] (M.lookup node outgoing))
+      )
   , poID: M.empty
   , lowestPoID: M.empty
   , cutvalue: M.empty
   , postOrder: 1
   , edgeVisited: S.empty
   }
+  where
+  incoming = byNode _.tgt edges
+  outgoing = byNode _.src edges
 
 layerOf :: forall n. Ord n => NSState n -> n -> Int
 layerOf st n = fromMaybe 0 (M.lookup n st.layer)
@@ -227,7 +244,7 @@ expandTightTree :: forall n. Ord n => Array n -> Array (NEdge n) -> NSState n ->
 expandTightTree nodes edges st = case A.head nodes of
   Nothing -> st
   Just root -> do
-    let stCleared = st { edgeVisited = S.empty, treeNode = S.empty, treeEdge = S.empty }
+    let stCleared = st { edgeVisited = S.empty }
     let result = tightTreeDFS edges root stCleared
     if result.count >= A.length nodes then result.st
     else case minimalSlack edges result.st of
@@ -250,28 +267,25 @@ expandTightTree nodes edges st = case A.head nodes of
 tightTreeDFS :: forall n. Ord n => Array (NEdge n) -> n -> NSState n -> { count :: Int, st :: NSState n }
 tightTreeDFS edges root st = do
   let st' = st { treeNode = S.insert root st.treeNode }
-  let connected = A.filter (\e -> (e.src == root || e.tgt == root) && not (S.member e.eid st'.edgeVisited)) edges
+  let connected = fromMaybe [] (M.lookup root st.connected)
   foldl visit { count: 1, st: st' } connected
   where
   visit acc e =
     if S.member e.eid acc.st.edgeVisited then acc
     else do
       let st1 = acc.st { edgeVisited = S.insert e.eid acc.st.edgeVisited }
-      let
-        current =
-          if S.member e.src st1.treeNode && not (S.member e.tgt st1.treeNode) then e.src
-          else if S.member e.tgt st1.treeNode && not (S.member e.src st1.treeNode) then e.tgt
-          else e.src
-      let other = if e.src == current then e.tgt else e.src
-      if S.member e.eid st1.treeEdge then
-        if S.member other st1.treeNode then acc { st = st1 }
-        else do
-          let r = tightTreeDFS edges other st1
-          { count: acc.count + r.count, st: r.st }
+      let other = if e.src == root then e.tgt else e.src
+      if S.member e.eid st1.treeEdge then do
+        let r = tightTreeDFS edges other st1
+        { count: acc.count + r.count, st: r.st }
       else if
         not (S.member other st1.treeNode)
           && e.delta == layerOf st1 e.tgt - layerOf st1 e.src then do
-        let st2 = st1 { treeEdge = S.insert e.eid st1.treeEdge }
+        let
+          st2 = st1
+            { treeEdge = S.insert e.eid st1.treeEdge
+            , treeOrder = A.snoc st1.treeOrder e
+            }
         let r = tightTreeDFS edges other st2
         { count: acc.count + r.count, st: r.st }
       else acc { st = st1 }
@@ -305,7 +319,7 @@ postorderDFS edges node st0 = do
           && (e.src == node || e.tgt == node)
           && not (S.member e.eid st0.edgeVisited)
       )
-      edges
+      (fromMaybe [] (M.lookup node st0.connected))
   let result = foldl visit { lowest: infInt, st: st0 } connected
   let myPo = result.st.postOrder
   let lowest' = min result.lowest myPo
@@ -327,7 +341,7 @@ postorderDFS edges node st0 = do
 
 cutvalues :: forall n. Ord n => Array n -> Array (NEdge n) -> NSState n -> NSState n
 cutvalues nodes edges st0 = do
-  let unknownInit = nodes <#> \n -> n /\ A.fromFoldable (S.fromFoldable (incidentTreeEdges edges st0 n))
+  let unknownInit = nodes <#> \n -> n /\ incidentTreeEdges edges st0 n
   let initSt = { unknown: M.fromFoldable unknownInit, cutvalue: M.empty :: Map Int Number }
   let leafs = A.filter (\n -> A.length (fromMaybe [] (M.lookup n initSt.unknown)) == 1) nodes
   let final = foldl (drainLeaf edges) initSt leafs
@@ -394,20 +408,18 @@ optimiseLoop :: forall n. Ord n => Int -> Array n -> Array (NEdge n) -> NSState 
 optimiseLoop iterLimit nodes edges st = go iterLimit st
   where
   go 0 s = s
-  go k s = case leaveEdge edges s of
+  go k s = case leaveEdge s of
     Nothing -> s
     Just leave -> case enterEdge edges leave s of
       Nothing -> s
       Just enter -> go (k - 1) (exchange nodes edges leave enter s)
 
--- | A tree edge with a negative cut value (below `fuzzyStZero`) is
--- | the candidate to leave the spanning tree.
-leaveEdge :: forall n. Array (NEdge n) -> NSState n -> Maybe (NEdge n)
-leaveEdge edges st = A.find
-  ( \e -> S.member e.eid st.treeEdge
-      && fromMaybe 0.0 (M.lookup e.eid st.cutvalue) < fuzzyStZero
-  )
-  edges
+-- | ELK iterates its LinkedHashSet in tree insertion order. Global edge
+-- | order can select another equal-cost optimum that reverses edge trunks.
+leaveEdge :: forall n. NSState n -> Maybe (NEdge n)
+leaveEdge st = A.find
+  (\e -> fromMaybe 0.0 (M.lookup e.eid st.cutvalue) < fuzzyStZero)
+  st.treeOrder
 
 enterEdge :: forall n. Ord n => Array (NEdge n) -> NEdge n -> NSState n -> Maybe (NEdge n)
 enterEdge edges leave st = (foldl scan { edge: Nothing, slack: infInt } edges).edge
@@ -448,7 +460,11 @@ exchange
   -> NSState n
   -> NSState n
 exchange nodes edges leave enter st = do
-  let st1 = st { treeEdge = S.insert enter.eid (S.delete leave.eid st.treeEdge) }
+  let
+    st1 = st
+      { treeEdge = S.insert enter.eid (S.delete leave.eid st.treeEdge)
+      , treeOrder = A.snoc (A.filter (\e -> e.eid /= leave.eid) st.treeOrder) enter
+      }
   let delta0 = layerOf st1 enter.tgt - layerOf st1 enter.src - enter.delta
   let delta = if isInHead st1 enter.tgt leave then delta0 else -delta0
   let

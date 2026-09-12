@@ -7,51 +7,71 @@ import Data.Foldable (foldl)
 import Data.Int as Int
 import Data.Map (Map)
 import Data.Map as M
-import Data.Maybe (Maybe(..))
+import Data.Maybe (Maybe(..), fromMaybe)
 import Data.Set (Set)
 import Data.Set as S
-import Data.Newtype (un)
+import Data.Number (abs)
 import Data.Tuple.Nested ((/\))
 import LayeredLayout.EdgeRouting.HyperEdges (SlotInfo, assignSlots)
-import LayeredLayout.EdgeRouting.Orthogonal (FineRect, ObstacleMap, buildObstacleMap, findRouteSlot, segmentsToObstacles, simplifySegments)
+import LayeredLayout.EdgeRouting.Orthogonal (FineRect, ObstacleMap, buildObstacleMap, findRouteSlot, isRouteClear, removeZeroLength, segmentsToObstacles, simplifySegments)
 import LayeredLayout.EdgeRouting.PortAssignment (PortAssignment, assignPorts, scaleFactor) as PA
 import LayeredLayout.EdgeRouting.PortAssignment (EdgePortOffsets)
-import LayeredLayout.Graph (Edge, EdgeId(..), NodeId, Port)
+import LayeredLayout.Graph (Edge, EdgeId, NodeId, Port, Side(..))
 import LayeredLayout.Grid (GridPos(..), gridX, gridY, sizeH, sizeW)
 import LayeredLayout.Result (Direction(..), EdgePath, EdgeSegment, NodePlacement)
+import LayeredLayout.JavaRandom (Random)
 
 scaleFactor :: Int
 scaleFactor = PA.scaleFactor
 
-routeAll :: Array Edge -> Array NodePlacement -> Map NodeId (Array Port) -> Array { edgeId :: EdgeId, nodes :: Array NodeId } -> EdgePortOffsets -> Array EdgePath
-routeAll edges placements portMap chains portOffsets = selfLoopPaths <> _.results (foldl routeNext { results: [], edgeObstacles: [] } ordered)
+routeAll :: Random -> Maybe (Map EdgeId SlotInfo) -> Array Edge -> Array NodePlacement -> Array NodePlacement -> Map NodeId (Array Port) -> Array { edgeId :: EdgeId, nodes :: Array NodeId } -> EdgePortOffsets -> Array EdgePath
+routeAll random planned edges placements obstaclePlacements portMap chains portOffsets = selfLoopPaths <>
+  if trustedPlan then
+    let
+      noObstacles = []
+    in
+      map (routeAssigned noObstacles noObstacles) ordered
+  else
+    let
+      -- Unplanned and manually moved layouts still need obstacle-aware routing.
+      nodeObstacles = buildObstacleMap obstaclePlacements
+      posMap = foldl (\m p -> M.insert p.node p m) M.empty obstaclePlacements
+      routeNext acc a =
+        let
+          filteredNodeObs = filteredFor a nodeObstacles posMap
+          allObstacles = filteredNodeObs <> acc.edgeObstacles
+          path = routeAssigned filteredNodeObs allObstacles a
+        in
+          { results: A.snoc acc.results path
+          , edgeObstacles: acc.edgeObstacles <> segmentsToObstacles path.segments
+          }
+    in
+      _.results (foldl routeNext { results: [], edgeObstacles: [] } ordered)
   where
   selfLoops = A.filter isSelfLoop edges
   regularEdges = A.filter (not <<< isSelfLoop) edges
-  selfLoopPaths = routeSelfLoops selfLoops placements
+  selfLoopPaths = if A.null selfLoops then [] else routeSelfLoops selfLoops placements
 
-  nodeObstacles = buildObstacleMap placements
-  posMap = foldl (\m p -> M.insert p.node p m) M.empty placements
   assignments = PA.assignPorts regularEdges placements portMap chains portOffsets
   ordered = orderForRouting assignments placements
-  slotMap = assignSlots assignments placements
+  slotMap = case planned of
+    Just slots -> slots
+    Nothing -> (assignSlots random assignments placements).slots
+  gapStarts = layerEnds obstaclePlacements
 
-  routeNext acc a = do
-    let filteredNodeObs = filteredFor a nodeObstacles posMap
-    let allObstacles = filteredNodeObs <> acc.edgeObstacles
-    let
-      path = case splitInfoFor slotMap a of
-        Just split -> routeSplit split filteredNodeObs allObstacles a
-        Nothing -> routeOne (channelYFor slotMap a) filteredNodeObs allObstacles a
-    let newEdgeObs = segmentsToObstacles path.segments
-    { results: acc.results <> [ path ], edgeObstacles: acc.edgeObstacles <> newEdgeObs }
+  trustedPlan = case planned of
+    Just _ -> A.all (\a -> a.fromSide == South && a.toSide == North && M.member a.edge.id slotMap) assignments
+    Nothing -> false
+  routeAssigned nodeObstacles obstacles a = case splitInfoFor gapStarts slotMap a of
+    Just split -> routeSplit split a
+    Nothing -> routeOne (channelYFor gapStarts slotMap a) nodeObstacles obstacles a
 
 isSelfLoop :: Edge -> Boolean
 isSelfLoop e = e.from.node == e.to.node
 
 -- | Port of ELK's `selfLoopDistribution: EQUALLY`. Each self-loop is
 -- | drawn as a horizontal-then-vertical-then-horizontal "C" attached
--- | to the east side of its node. When a node has multiple
+-- | to the west side of its node. When a node has multiple
 -- | self-loops, the y-positions of the entry / exit stubs are
 -- | distributed equally over the node's height (plus the bump
 -- | depth) so loops don't overlap.
@@ -78,7 +98,6 @@ routeSelfLoops selfLoops placements = A.concat (A.mapWithIndex perNode grouped)
     let sf = Int.toNumber PA.scaleFactor
     let x = gridX placement.position * sf
     let y = gridY placement.position * sf
-    let w = sizeW placement.size * sf
     let h = sizeH placement.size * sf
     -- ELK's selfLoopDistribution=EQUALLY draws self-loops on the
     -- west (left) side, growing concentrically from the middle:
@@ -111,8 +130,8 @@ routeSelfLoops selfLoops placements = A.concat (A.mapWithIndex perNode grouped)
 
   gridPos (cx /\ cy) = GridPos (cx /\ cy)
 
-routeIncremental :: Set NodeId -> Array EdgePath -> Array Edge -> Array NodePlacement -> Map NodeId (Array Port) -> Array { edgeId :: EdgeId, nodes :: Array NodeId } -> EdgePortOffsets -> Array EdgePath
-routeIncremental changedNodes prevEdges edges placements portMap chains portOffsets = selfLoopPaths <> _.results (foldl routeNext { results: [], edgeObstacles: [] } ordered)
+routeIncremental :: Random -> Set NodeId -> Array EdgePath -> Array Edge -> Array NodePlacement -> Map NodeId (Array Port) -> Array { edgeId :: EdgeId, nodes :: Array NodeId } -> EdgePortOffsets -> Array EdgePath
+routeIncremental random changedNodes prevEdges edges placements portMap chains portOffsets = selfLoopPaths <> _.results (foldl routeNext { results: [], edgeObstacles: [] } ordered)
   where
   selfLoops = A.filter isSelfLoop edges
   regularEdges = A.filter (not <<< isSelfLoop) edges
@@ -122,7 +141,8 @@ routeIncremental changedNodes prevEdges edges placements portMap chains portOffs
   posMap = foldl (\m p -> M.insert p.node p m) M.empty placements
   assignments = PA.assignPorts regularEdges placements portMap chains portOffsets
   ordered = orderForRouting assignments placements
-  slotMap = assignSlots assignments placements
+  slotMap = (assignSlots random assignments placements).slots
+  gapStarts = layerEnds placements
   touchesChanged a =
     S.member a.edge.from.node changedNodes
       || S.member a.edge.to.node changedNodes
@@ -133,12 +153,19 @@ routeIncremental changedNodes prevEdges edges placements portMap chains portOffs
     let allObstacles = filteredNodeObs <> acc.edgeObstacles
     let
       path =
-        if touchesChanged a then routeOne (channelYFor slotMap a) filteredNodeObs allObstacles a
+        if touchesChanged a then routeOne (channelYFor gapStarts slotMap a) filteredNodeObs allObstacles a
         else case M.lookup a.edge.id prevMap of
           Just prev -> prev
-          Nothing -> routeOne (channelYFor slotMap a) filteredNodeObs allObstacles a
+          Nothing -> routeOne (channelYFor gapStarts slotMap a) filteredNodeObs allObstacles a
     let newEdgeObs = segmentsToObstacles path.segments
     { results: acc.results <> [ path ], edgeObstacles: acc.edgeObstacles <> newEdgeObs }
+
+-- Routing channels start after the whole reserved layer, not merely after
+-- the connected ports of the shorter nodes in that layer.
+layerEnds :: Array NodePlacement -> Map Int Number
+layerEnds = foldl
+  (\ends node -> M.insertWith max node.layer ((gridY node.position + sizeH node.size) * Int.toNumber scaleFactor) ends)
+  M.empty
 
 -- | Compute the slot-derived channel y for an edge, if any.
 -- | y = gapTop + edgeNodeBetweenLayers + slot * edgeEdgeBetweenLayers
@@ -147,14 +174,14 @@ routeIncremental changedNodes prevEdges edges placements portMap chains portOffs
 -- | grid). The gap is sized to fit the slots in
 -- | `LayeredLayout.CoordAssignment.computeLayerGaps`, so channels
 -- | never run past gapBottom.
-channelYFor :: Map EdgeId SlotInfo -> PA.PortAssignment -> Maybe Number
-channelYFor slotMap a = do
+channelYFor :: Map Int Number -> Map EdgeId SlotInfo -> PA.PortAssignment -> Maybe Number
+channelYFor gapStarts slotMap a = do
   info <- M.lookup a.edge.id slotMap
-  Just (slotY info info.slot)
+  Just (slotY gapStarts info info.slot)
 
 -- | Convert a slot index to absolute fine y inside its gap.
-slotY :: SlotInfo -> Int -> Number
-slotY info slotIdx = info.gapTop + scaledNodePad + Int.toNumber slotIdx * scaledSlotGap
+slotY :: Map Int Number -> SlotInfo -> Int -> Number
+slotY gapStarts info slotIdx = fromMaybe 0.0 (M.lookup info.gap gapStarts) + scaledNodePad + Int.toNumber slotIdx * scaledSlotGap
   where
   scaledNodePad = 1.0 * Int.toNumber PA.scaleFactor
   scaledSlotGap = 2.5 * Int.toNumber PA.scaleFactor
@@ -164,16 +191,17 @@ slotY info slotIdx = info.gapTop + scaledNodePad + Int.toNumber slotIdx * scaled
 -- | and the split-x. Returns the data needed to draw a 4-bend trunk
 -- | (slot1Y, splitX, slot2Y) for this edge.
 splitInfoFor
-  :: Map EdgeId SlotInfo
+  :: Map Int Number
+  -> Map EdgeId SlotInfo
   -> PA.PortAssignment
   -> Maybe { slot1Y :: Number, splitX :: Number, slot2Y :: Number }
-splitInfoFor slotMap a = do
+splitInfoFor gapStarts slotMap a = do
   info <- M.lookup a.edge.id slotMap
   partner <- info.partner
   Just
-    { slot1Y: slotY info info.slot
+    { slot1Y: slotY gapStarts info info.slot
     , splitX: partner.splitX
-    , slot2Y: slotY info partner.slot
+    , slot2Y: slotY gapStarts info partner.slot
     }
 
 filteredFor :: PA.PortAssignment -> ObstacleMap -> Map NodeId NodePlacement -> ObstacleMap
@@ -211,8 +239,27 @@ orderForRouting assignments placements = A.sortBy comparator assignments
 
 routeOne :: Maybe Number -> ObstacleMap -> ObstacleMap -> PA.PortAssignment -> EdgePath
 routeOne slotY' nodeObstacles obstacles assignment = do
-  let raw = findRouteSlot slotY' nodeObstacles obstacles assignment.fromSide assignment.fromPos assignment.toSide assignment.toPos
-  let segments = simplifySegments obstacles raw
+  let
+    segments = case slotY', assignment.fromSide, assignment.toSide of
+      -- A planned layered channel already resolves trunk conflicts. Searching
+      -- around previously routed edges can collapse distinct slots and change
+      -- the separation constraints used by post-routing node compaction.
+      Just channel, South, North ->
+        let
+          planned =
+            if abs (sx - tx) <= 0.001 then
+              [ { start: GridPos assignment.fromPos, end: GridPos assignment.toPos, direction: V } ]
+            else removeZeroLength
+              [ { start: GridPos assignment.fromPos, end: GridPos (sx /\ channel), direction: V }
+              , { start: GridPos (sx /\ channel), end: GridPos (tx /\ channel), direction: H }
+              , { start: GridPos (tx /\ channel), end: GridPos assignment.toPos, direction: V }
+              ]
+        in
+          if isRouteClear nodeObstacles planned then planned
+          else simplifySegments obstacles
+            (findRouteSlot slotY' nodeObstacles obstacles assignment.fromSide assignment.fromPos assignment.toSide assignment.toPos)
+      _, _, _ -> simplifySegments obstacles
+        (findRouteSlot slotY' nodeObstacles obstacles assignment.fromSide assignment.fromPos assignment.toSide assignment.toPos)
   let bends = findBends segments
   { edge: assignment.edge.id
   , segments
@@ -221,6 +268,9 @@ routeOne slotY' nodeObstacles obstacles assignment = do
   , jumps: []
   , reversed: false
   }
+  where
+  sx /\ _ = assignment.fromPos
+  tx /\ _ = assignment.toPos
 
 -- | Route a long-edge segment whose hyperedge was split during
 -- | critical-cycle breaking. The path takes two horizontal trunks
@@ -231,11 +281,9 @@ routeOne slotY' nodeObstacles obstacles assignment = do
 -- | split-aware branch.
 routeSplit
   :: { slot1Y :: Number, splitX :: Number, slot2Y :: Number }
-  -> ObstacleMap
-  -> ObstacleMap
   -> PA.PortAssignment
   -> EdgePath
-routeSplit split _nodeObstacles _obstacles assignment = do
+routeSplit split assignment = do
   let (sx /\ sy) = assignment.fromPos
   let (tx /\ ty) = assignment.toPos
   let

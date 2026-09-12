@@ -1,3 +1,8 @@
+-- Copyright (c) 2017 Kiel University and others.
+-- SPDX-License-Identifier: EPL-2.0
+-- Translated from ELK c831ba4613dfd6b0055851193956560351d2f907:
+-- HorizontalGraphCompactor.process and specialSpacingsHandler.
+--
 -- | Phase 5 of the post-routing graph compaction port: the
 -- | orchestrator that wires the phase 4 transformer, the phase 2
 -- | `OneDimensionalCompactor` lifecycle and the phase 3
@@ -13,6 +18,8 @@
 -- | result back when applying the new positions.
 module LayeredLayout.Compaction.HorizontalGraphCompactor
   ( CompactionStrategy(..)
+  , WithinLayerSpacings
+  , defaultWithinLayerSpacings
   , BetweenLayersSpacings
   , defaultBetweenLayersSpacings
   , compactPostRouting
@@ -20,6 +27,9 @@ module LayeredLayout.Compaction.HorizontalGraphCompactor
 
 import Prelude
 
+import Data.Array (null, uncons)
+import Data.Foldable (all, foldl)
+import Data.Int (toNumber)
 import Data.Map (Map)
 import Data.Maybe (Maybe(..))
 import Data.Tuple.Nested ((/\))
@@ -32,7 +42,9 @@ import LayeredLayout.Compaction.LGraphToCGraphTransformer
   )
 import LayeredLayout.Compaction.NetworkSimplexCompaction (CompactionHooks, networkSimplexCompaction)
 import LayeredLayout.Compaction.OneD
-  ( CNode
+  ( CGraph
+  , CNode
+  , allCNodes
   , ICompactionAlgorithm
   , ISpacingsHandler
   , compact
@@ -43,8 +55,9 @@ import LayeredLayout.Compaction.OneD
   , setSpacingsHandler
   )
 import LayeredLayout.Compaction.EdgeAwareScanlineConstraints (edgeAwareScanlineConstraints)
-import LayeredLayout.Graph (Edge, NodeId, Port)
-import LayeredLayout.Grid (GridPos(..), GridSize(..), gridX, gridY, sizeH, sizeW)
+import LayeredLayout.EdgeRouting (scaleFactor)
+import LayeredLayout.Graph (Edge, NodeId, Port, Side(..))
+import LayeredLayout.Grid (GridPos(..), GridRect, GridSize(..), gridX, gridY, sizeH, sizeW)
 import LayeredLayout.Result (Direction(..), EdgePath, EdgeSegment, NodePlacement) as R
 
 -- | Which compaction algorithm to drive. Only `EdgeLength` is
@@ -53,6 +66,16 @@ import LayeredLayout.Result (Direction(..), EdgePath, EdgeSegment, NodePlacement
 data CompactionStrategy = EdgeLength
 
 derive instance Eq CompactionStrategy
+
+-- | Global perpendicular-axis spacings in fine-grid units. These drive
+-- | the scanline hitboxes independently of the between-layer matrix.
+type WithinLayerSpacings =
+  { nodeNode :: Number
+  , edgeEdge :: Number
+  }
+
+defaultWithinLayerSpacings :: WithinLayerSpacings
+defaultWithinLayerSpacings = { nodeNode: 20.0, edgeEdge: 10.0 }
 
 -- | The BETWEEN_LAYERS spacing matrix the compactor's spacings handler
 -- | hands back per node-type pair. Mirrors ELK's
@@ -63,9 +86,9 @@ derive instance Eq CompactionStrategy
 -- | values directly:
 -- |   * `nodeNode` = `layered.spacing.nodeNodeBetweenLayers`
 -- |   * `edgeNode` = `layered.spacing.edgeNodeBetweenLayers`
--- |   * `edgeEdge` = `spacing.edgeEdge` (ELK's `SPACING_EDGE_EDGE`)
--- | The same `edgeEdge` drives the edge-aware scanline's hitbox
--- | inflation, so both read this one source.
+-- |   * `edgeEdge` = `layered.spacing.edgeEdgeBetweenLayers`
+-- | LABEL/LABEL is the source matrix exception: it uses global edge-edge
+-- | spacing even along the between-layer axis.
 type BetweenLayersSpacings =
   { nodeNode :: Number
   , edgeNode :: Number
@@ -75,7 +98,7 @@ type BetweenLayersSpacings =
 -- | The values the current test graphs (hugeGraph + ElkDiff panels)
 -- | are validated against: hugeGraph overrides node-node and edge-node
 -- | downward from ELK's 20/10 defaults, and edge-edge stays at ELK's
--- | `SPACING_EDGE_EDGE` default of 10.
+-- | `SPACING_EDGE_EDGE_BETWEEN_LAYERS` default of 10.
 defaultBetweenLayersSpacings :: BetweenLayersSpacings
 defaultBetweenLayersSpacings =
   { nodeNode: 8.0
@@ -88,29 +111,58 @@ defaultBetweenLayersSpacings =
 ----------------------------------------------------------------
 
 -- | Run post-routing compaction along markgraf's layer-growth axis
--- | (Y). Returns updated node placements and edge paths.
+-- | (Y). Returns placements, paths, and the complete coarse DOWN layout frame.
 compactPostRouting
   :: CompactionStrategy
+  -> WithinLayerSpacings
   -> BetweenLayersSpacings
   -> { nodes :: Array R.NodePlacement
      , edges :: Array Edge
      , paths :: Array R.EdgePath
      , ports :: Map NodeId (Array Port)
      }
-  -> { nodes :: Array R.NodePlacement, edges :: Array R.EdgePath }
-compactPostRouting strategy spacings input = do
+  -> { nodes :: Array R.NodePlacement, edges :: Array R.EdgePath, boundingBox :: GridRect }
+compactPostRouting strategy within spacings input = do
   let swapped = swapInput input
   let out = transform swapped
   let routed = buildRoutedEdges swapped
   let hooks = buildHooks out routed
   let
     state0 = newOneD out.cGraph
-      # setSpacingsHandler (specialSpacings spacings hooks)
-      # setConstraintAlgorithm (edgeAwareScanlineConstraints spacings.edgeEdge)
+      # setSpacingsHandler (specialSpacings within spacings hooks)
+      # setConstraintAlgorithm (edgeAwareScanlineConstraints within)
       # setCompactionAlgorithm (algorithmFor strategy hooks)
   let compacted = (compact state0 # finish).cGraph
   let applied = applyLayout compacted { nodes: swapped.nodes, edges: swapped.edges, paths: swapped.paths }
-  swapOutput applied
+  { nodes: applied.nodes <#> swapNode
+  , edges: applied.edges <#> swapPath
+  , boundingBox: compactionBounds compacted
+  }
+
+-- | LGraphToCGraphTransformer.applyLayout measures every final hitbox.
+-- | Virtual segments and reserved margins remain part of the component
+-- | frame even when their extents are absent from the rendered paths.
+compactionBounds :: forall a. CGraph a -> GridRect
+compactionBounds graph = case uncons (allCNodes graph) of
+  Nothing -> { pos: GridPos (0.0 /\ 0.0), size: GridSize (0.0 /\ 0.0) }
+  Just { head, tail } ->
+    let
+      first = head.hitbox
+      extent = foldl
+        ( \a node ->
+            let
+              b = node.hitbox
+            in
+              { left: min a.left b.x, top: min a.top b.y, right: max a.right (b.x + b.width), bottom: max a.bottom (b.y + b.height) }
+        )
+        { left: first.x, top: first.y, right: first.x + first.width, bottom: first.y + first.height }
+        tail
+    in
+      { pos: GridPos (extent.top / sf /\ extent.left / sf)
+      , size: GridSize ((extent.bottom - extent.top) / sf /\ (extent.right - extent.left) / sf)
+      }
+  where
+  sf = toNumber scaleFactor
 
 algorithmFor
   :: forall a
@@ -122,21 +174,21 @@ algorithmFor EdgeLength hooks = networkSimplexCompaction hooks
 ----------------------------------------------------------------
 -- ISpacingsHandler
 --
--- Matches ELK's `specialSpacingsHandler` minus the per-LNode-type
--- lookup (markgraf does not type its nodes). Same-edge VS pairs
--- collapse to 0; otherwise hand back 1 grid unit so the compactor
--- still keeps daylight between hitboxes.
+-- Source specialSpacingsHandler: same-edge VS pairs have horizontal
+-- spacing zero; other pairs use the node-type matrix. ignoreSpacing
+-- belongs to the scanline hitbox calculations, not this handler.
 ----------------------------------------------------------------
 
--- | All CNodes are now in router-grid; one node-grid unit of margin
--- | translates to `scaleFactor` router-grid units. Mirrors ELK's
--- | `specialSpacingsHandler` (HorizontalGraphCompactor.java:193-251):
--- | same-edge VS pairs collapse to 0 horizontally (1 vertically to
--- | preserve column overlap), and any CNode whose facing
--- | `ignoreSpacing` side is set returns 0 — used by N/S-port VSes
--- | anchored to a node edge.
-specialSpacings :: forall a. BetweenLayersSpacings -> CompactionHooks a -> ISpacingsHandler a
-specialSpacings spacings hooks =
+-- | Source node-type spacing lookup for NORMAL, LABEL, and LONG_EDGE.
+-- | The vertical handler is used only by quadratic constraints upstream;
+-- | this adapter selects the orthogonal edge-aware scanline.
+specialSpacings
+  :: forall a
+   . WithinLayerSpacings
+  -> BetweenLayersSpacings
+  -> CompactionHooks a
+  -> ISpacingsHandler a
+specialSpacings within spacings hooks =
   { horizontalSpacing
   , verticalSpacing
   }
@@ -145,17 +197,15 @@ specialSpacings spacings hooks =
 
   horizontalSpacing a b
     | hooks.sameEdgeVerticalSegments a b = 0.0
-    | a.ignoreSpacing.right || b.ignoreSpacing.left = 0.0
+    | a.kind == Just "label" && b.kind == Just "label" = within.edgeEdge
     | otherwise = pairSpacing a b
 
   verticalSpacing a b
     | hooks.sameEdgeVerticalSegments a b = 1.0
-    | facingVerticalIgnored a b = 0.0
-    | otherwise = pairSpacing a b
-
-  facingVerticalIgnored a b
-    | a.hitbox.y <= b.hitbox.y = a.ignoreSpacing.down || b.ignoreSpacing.up
-    | otherwise = a.ignoreSpacing.up || b.ignoreSpacing.down
+    | otherwise = case classify a b of
+        NodeNode -> within.nodeNode
+        EdgeNode -> 10.0 -- global SPACING_EDGE_NODE default; no adapter option
+        EdgeEdge -> within.edgeEdge
 
 -- | Pair classification used by the spacings matrix below. Mirrors
 -- | ELK's `nodeTypeSpacingOptionsHorizontal` matrix (BETWEEN_LAYERS
@@ -163,6 +213,7 @@ specialSpacings spacings hooks =
 data PairKind = NodeNode | EdgeNode | EdgeEdge
 
 classify :: forall a. CNode a -> CNode a -> PairKind
+classify a b | a.kind == Just "label" && b.kind == Just "label" = EdgeEdge
 classify a b = case isVS a, isVS b of
   true, true -> EdgeEdge
   true, false -> EdgeNode
@@ -195,7 +246,16 @@ swapInput i =
   { nodes: i.nodes <#> swapNode
   , edges: i.edges
   , paths: i.paths <#> swapPath
-  , ports: i.ports
+  , ports: if all null i.ports then i.ports else i.ports <#> map swapPort
+  }
+
+swapPort :: Port -> Port
+swapPort port = port
+  { side = case port.side of
+      North -> West
+      South -> East
+      East -> South
+      West -> North
   }
 
 swapNode :: R.NodePlacement -> R.NodePlacement
@@ -226,12 +286,4 @@ swapPos g = GridPos (gridY g /\ gridX g)
 
 swapSize :: GridSize -> GridSize
 swapSize g = GridSize (sizeH g /\ sizeW g)
-
-swapOutput
-  :: { nodes :: Array R.NodePlacement, edges :: Array R.EdgePath }
-  -> { nodes :: Array R.NodePlacement, edges :: Array R.EdgePath }
-swapOutput o =
-  { nodes: o.nodes <#> swapNode
-  , edges: o.edges <#> swapPath
-  }
 

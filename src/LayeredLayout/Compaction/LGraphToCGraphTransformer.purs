@@ -1,3 +1,9 @@
+-- Copyright (c) 2017 Kiel University and others.
+-- SPDX-License-Identifier: EPL-2.0
+-- Translated from ELK c831ba4613dfd6b0055851193956560351d2f907:
+-- LGraphToCGraphTransformer.collectVerticalSegmentsOrthogonal,
+-- mergeVerticalSegments, verticalSegmentToCNode, and applyLayout.
+--
 -- | Port of ELK's `LGraphToCGraphTransformer` adapted to markgraf's
 -- | post-routing data model. Builds a compaction graph from a
 -- | `LayoutResult`-shaped input (node placements + routed edges) and
@@ -23,7 +29,7 @@ import Data.Array as A
 import Data.Foldable (foldl)
 import Data.Map (Map)
 import Data.Map as M
-import Data.Maybe (Maybe(..), fromMaybe)
+import Data.Maybe (Maybe(..), fromMaybe, isJust)
 import Data.Set as S
 import Data.Tuple.Nested (type (/\), (/\))
 import LayeredLayout.Compaction.NetworkSimplexCompaction (CompactionHooks, ExtraEdge, edgeWeight)
@@ -36,6 +42,7 @@ import LayeredLayout.Compaction.OneD
   , Quadruplet
   , Rect
   , addCGroup
+  , fuzzyEq
   , addCNode
   , addCNodeToGroup
   , allCNodes
@@ -46,10 +53,11 @@ import LayeredLayout.Compaction.OneD
   )
 import LayeredLayout.Compaction.VerticalSegment (VerticalSegment, compareVS, intersects, joinWith, newVerticalSegment)
 import LayeredLayout.EdgeRouting (scaleFactor)
+import LayeredLayout.DummyNodes (isLabelDummy)
 import Data.Int (toNumber)
 import LayeredLayout.Graph (Edge, EdgeId, NodeId, Port, PortId, Side(..))
 import LayeredLayout.Grid (GridPos(..), gridX, gridY, sizeH, sizeW)
-import LayeredLayout.Result (Direction(..), EdgePath, EdgeSegment, NodePlacement) as R
+import LayeredLayout.Result (Direction(..), EdgePath, NodePlacement) as R
 
 -- | What kind of layered-graph object each `CNode` represents.
 data CNodeOrigin
@@ -112,7 +120,7 @@ transformNodes :: Map NodeId (Int /\ Int) -> Array R.NodePlacement -> TransformO
 transformNodes degrees nodes out = foldl placeNode out nodes
   where
   placeNode acc np = do
-    let added = addCNode { origin: Just (NodeOrigin np.node), kind: Nothing, hitbox: hitboxFor np } acc.cGraph
+    let added = addCNode { origin: Just (NodeOrigin np.node), kind: if isLabelDummy np.node then Just "label" else Nothing, hitbox: hitboxFor np } acc.cGraph
     let group = addCGroup { master: Just added.id, nodes: [ added.id ] } added.graph
     let inc /\ outd = fromMaybe (0 /\ 0) (M.lookup np.node degrees)
     let lock = nodeLockFor (inc - outd)
@@ -162,59 +170,54 @@ collectForEdge
   -> { nextId :: Int, segments :: Array VerticalSegment }
   -> RoutedEdge
   -> { nextId :: Int, segments :: Array VerticalSegment }
-collectForEdge out s0 e
-  -- Self-loops are routed separately and are not part of the compaction
-  -- graph (ELK LGraphToCGraphTransformer.java:478). Collecting their
-  -- vertical segment lets the simplex slide the loop's far edge away
-  -- from its node, breaking the C-shape. Mirror the line 427 skip.
-  | e.src == e.tgt = s0
 collectForEdge out s0 e = do
   let mSrcId = M.lookup e.src out.nodeToC
   let mTgtId = M.lookup e.tgt out.nodeToC
   let mSrcHB = mSrcId >>= \nid -> lookupCNode nid out.cGraph <#> _.hitbox
   let mTgtHB = mTgtId >>= \nid -> lookupCNode nid out.cGraph <#> _.hitbox
+  let bends = e.path.bends
   let verticals = verticalSegmentsOnPath e.path
   let lastIdx = A.length verticals - 1
+  -- ELK consumes bendpoints, not port anchors. Its last-segment flags
+  -- use the penultimate bend, even when the final bend pair is horizontal.
+  let lastBendStart = A.index bends (A.length bends - 2)
   let
+    beforeRegular = case e.srcSide, A.head bends, mSrcId, mSrcHB of
+      North, Just first, Just nid, Just hb -> appendSourceNS e nid hb first { side: North, down: true } s0
+      South, Just first, Just nid, Just hb -> appendSourceNS e nid hb first { side: South, down: false } s0
+      _, _, _, _ -> s0
     placed = foldl
-      (placeSeg e mSrcHB mTgtHB lastIdx)
-      s0
+      (placeSeg e mSrcHB mTgtHB lastBendStart lastIdx)
+      beforeRegular
       (A.mapWithIndex (\i seg -> i /\ seg) verticals)
-  -- ELK mirrors edge.getSource()/getTarget() being on NORTH/SOUTH ports
-  -- by appending a synthetic VS anchored to the node edge with the
-  -- node-facing ignoreSpacing side set. Port:LGraphToCGraphTransformer.java:234-247, 296-317.
-  let
-    afterSrcNS = case e.srcSide, A.head verticals, mSrcId, mSrcHB of
-      North, Just first, Just nid, Just hb -> appendSourceNS e nid hb first { side: North, down: true } placed
-      South, Just first, Just nid, Just hb -> appendSourceNS e nid hb first { side: South, down: false } placed
-      _, _, _, _ -> placed
-  case e.tgtSide, A.last verticals, mTgtId, mTgtHB of
-    North, Just last_, Just nid, Just hb -> appendTargetNS e nid hb last_ { side: North, down: true } afterSrcNS
-    South, Just last_, Just nid, Just hb -> appendTargetNS e nid hb last_ { side: South, down: false } afterSrcNS
-    _, _, _, _ -> afterSrcNS
+  case e.tgtSide, A.last bends, mTgtId, mTgtHB of
+    North, Just last_, Just nid, Just hb -> appendTargetNS e nid hb last_ { side: North, down: true } placed
+    South, Just last_, Just nid, Just hb -> appendTargetNS e nid hb last_ { side: South, down: false } placed
+    _, _, _, _ -> placed
 
 verticalSegmentsOnPath :: R.EdgePath -> Array { start :: GridPos, end :: GridPos }
-verticalSegmentsOnPath p = A.mapMaybe asVertical p.segments
-  where
-  asVertical :: R.EdgeSegment -> Maybe { start :: GridPos, end :: GridPos }
-  asVertical seg = case seg.direction of
-    R.V -> Just { start: seg.start, end: seg.end }
-    R.H -> Nothing
+verticalSegmentsOnPath p =
+  A.filter (\seg -> not (fuzzyEq (gridY seg.start) (gridY seg.end))) $
+    A.zipWith (\start end -> { start, end }) p.bends (A.drop 1 p.bends)
 
 placeSeg
   :: RoutedEdge
   -> Maybe Rect
   -> Maybe Rect
+  -> Maybe GridPos
   -> Int
   -> { nextId :: Int, segments :: Array VerticalSegment }
   -> Int /\ { start :: GridPos, end :: GridPos }
   -> { nextId :: Int, segments :: Array VerticalSegment }
-placeSeg e mSrcHB mTgtHB lastIdx s (i /\ seg) = do
+placeSeg e mSrcHB mTgtHB lastBendStart lastIdx s (i /\ seg) = do
   let isFirst = i == 0
   let isLast = i == lastIdx
   let vs0 = newVerticalSegment s.nextId seg.start seg.end Nothing e.edgeId
   let vs1 = if isFirst then applyFirstRegularFlags vs0 mSrcHB seg.end else vs0
-  let vs2 = if isLast then applyLastRegularFlags vs1 mTgtHB seg.start else vs1
+  let
+    vs2 = case isLast, lastBendStart of
+      true, Just bend -> applyLastRegularFlags vs1 mTgtHB bend
+      _, _ -> vs1
   { nextId: s.nextId + 1, segments: s.segments <> [ vs2 ] }
 
 nsSide :: Side -> Boolean
@@ -230,7 +233,7 @@ applyFirstRegularFlags vs Nothing _ = vs
 applyFirstRegularFlags vs (Just hb) bend2 = vs { ignoreSpacing = flagFor hb bend2 vs.ignoreSpacing }
 
 -- | ELK LGraphToCGraphTransformer.java:280-291. The last vertical segment
--- | uses bend1 (= seg.start) against the target node.
+-- | uses the penultimate bend against the target node.
 applyLastRegularFlags :: VerticalSegment -> Maybe Rect -> GridPos -> VerticalSegment
 applyLastRegularFlags vs Nothing _ = vs
 applyLastRegularFlags vs (Just hb) bend1 = vs { ignoreSpacing = flagFor hb bend1 vs.ignoreSpacing }
@@ -241,7 +244,7 @@ flagFor hb bend q
   | gridY bend > hb.y + hb.height = q { up = true }
   | otherwise = q { up = true, down = true }
 
--- | Append a synthetic VS anchored from the first bend (port position)
+-- | Append a synthetic VS anchored from the first bend
 -- | down/up to the source node edge, mirroring ELK lines 234-247.
 -- | `info.side` records the port, `info.down` says which ignoreSpacing
 -- | flag faces the node interior (NORTH ports anchor onto node.top → the
@@ -250,13 +253,12 @@ appendSourceNS
   :: RoutedEdge
   -> CNodeId
   -> Rect
-  -> { start :: GridPos, end :: GridPos }
+  -> GridPos
   -> { side :: Side, down :: Boolean }
   -> { nextId :: Int, segments :: Array VerticalSegment }
   -> { nextId :: Int, segments :: Array VerticalSegment }
-appendSourceNS e nid hb firstSeg info s = do
+appendSourceNS e nid hb bend1 info s = do
   let anchor = anchorY hb info
-  let bend1 = firstSeg.start
   let
     vs = (newVerticalSegment s.nextId bend1 (movedY anchor bend1) (Just nid) e.edgeId)
       { aPort = Just { node: e.src, side: info.side }
@@ -269,13 +271,12 @@ appendTargetNS
   :: RoutedEdge
   -> CNodeId
   -> Rect
-  -> { start :: GridPos, end :: GridPos }
+  -> GridPos
   -> { side :: Side, down :: Boolean }
   -> { nextId :: Int, segments :: Array VerticalSegment }
   -> { nextId :: Int, segments :: Array VerticalSegment }
-appendTargetNS e nid hb lastSeg info s = do
+appendTargetNS e nid hb bend1 info s = do
   let anchor = anchorY hb info
-  let bend1 = lastSeg.end
   let
     vs = (newVerticalSegment s.nextId bend1 (movedY anchor bend1) (Just nid) e.edgeId)
       { aPort = Just { node: e.tgt, side: info.side }
@@ -334,7 +335,7 @@ placeMerged allEdges out vs = do
     , edgeToCs = foldl
         (\m eid -> M.insertWith (<>) eid [ added.id ] m)
         out.edgeToCs
-        vs.representedEdges
+        (A.nub vs.representedEdges)
     , lockMap = M.insert added.id (vsLockFor allEdges vs.representedEdges) out.lockMap
     }
 
@@ -361,36 +362,47 @@ buildRoutedEdges input = A.mapMaybe pair input.paths
   where
   edgeById = M.fromFoldable (input.edges <#> \e -> e.id /\ e)
 
-  -- | ELK works on the post-cycle-break "layout direction": for an edge
-  -- | the cycle breaker reversed, the layout source is the logical
-  -- | target and vice versa. The routed segments are stored in layout
-  -- | direction (see `shiftSegments`' `reversed` branch), so the
-  -- | compactor needs src/tgt and the port sides flipped too —
-  -- | otherwise the edge-length minimization pulls the higher layer
-  -- | DOWN toward the lower layer and collapses layering.
+  -- ELK compacts in acyclic layout direction. Public paths have already
+  -- been canonicalized to the original edge direction by stitchChains,
+  -- so reverse both their geometry and endpoint metadata for this pass.
   pair p = do
     e <- M.lookup p.edge edgeById
     let
       srcN /\ srcPort /\ tgtN /\ tgtPort =
         if p.reversed then e.to.node /\ e.to.port /\ e.from.node /\ e.from.port
         else e.from.node /\ e.from.port /\ e.to.node /\ e.to.port
+      path =
+        if p.reversed then p
+          { segments = A.reverse (p.segments <#> \s -> s { start = s.end, end = s.start })
+          , bends = A.reverse p.bends
+          }
+        else p
+      sourceSide = case A.head path.segments of
+        Just segment -> outwardSide East segment.start segment.end
+        Nothing -> East
+      targetSide = case A.last path.segments of
+        Just segment -> outwardSide West segment.end segment.start
+        Nothing -> West
     Just
       { edgeId: p.edge
       , src: srcN
       , tgt: tgtN
-      , srcSide: portSide East input.ports srcN srcPort
-      , tgtSide: portSide West input.ports tgtN tgtPort
-      , path: p
+      , srcSide: portSide sourceSide input.ports srcN srcPort
+      , tgtSide: portSide targetSide input.ports tgtN tgtPort
+      , path
       }
 
--- | The compactor frame is horizontal: a *normal* source (output) port
--- | sits EAST and a normal target (input) port WEST. Only the opposite
--- | sides (WEST output / EAST input) are inverted ports — the only case
--- | ELK's `addEdgeConstraints` emits its delta=1 pull edges for. Edges
--- | that carry no explicit `LPort` (the common case) must therefore
--- | default to their *normal* side per endpoint, otherwise every
--- | forward edge would masquerade as an EAST-input inverted port and
--- | drag its vertical segments up against the source node.
+-- | Named ports retain their authored side. Implicit ports, including
+-- | self-loop ports, recover it from the outward endpoint segment of the
+-- | oriented path. Ordinary layout-direction sources/targets are EAST/WEST.
+outwardSide :: Side -> GridPos -> GridPos -> Side
+outwardSide fallback anchor bend
+  | gridX bend > gridX anchor = East
+  | gridX bend < gridX anchor = West
+  | gridY bend > gridY anchor = South
+  | gridY bend < gridY anchor = North
+  | otherwise = fallback
+
 portSide :: Side -> Map NodeId (Array Port) -> NodeId -> Maybe PortId -> Side
 portSide dflt portsMap node mPortId = fromMaybe dflt $ do
   pid <- mPortId
@@ -405,6 +417,7 @@ portSide dflt portsMap node mPortId = fromMaybe dflt $ do
 buildHooks :: TransformOutput -> Array RoutedEdge -> CompactionHooks CNodeOrigin
 buildHooks out routedEdges =
   { sameEdgeVerticalSegments
+  , portAnchoredSegment
   , vsLNodePair
   , edgeLengthEdges: \_ -> extraEdges
   }
@@ -414,6 +427,10 @@ buildHooks out routedEdges =
       A.any (\e -> A.elem e vb.representedEdges) va.representedEdges
     _, _ -> false
 
+  portAnchoredSegment node = case node.origin of
+    Just (SegmentOrigin segment) -> isJust segment.aPort
+    _ -> false
+
   vsLNodePair :: CNode CNodeOrigin -> CNode CNodeOrigin -> Boolean
   vsLNodePair a b = case a.origin, b.origin of
     Just (SegmentOrigin _), Just (NodeOrigin _) -> true
@@ -421,7 +438,13 @@ buildHooks out routedEdges =
     _, _ -> false
 
   extraEdges :: Array ExtraEdge
-  extraEdges = routedEdges >>= edgesForLEdge
+  extraEdges = allCNodes out.cGraph >>= \node -> case node.origin of
+    Just (NodeOrigin id) -> fromMaybe [] (M.lookup id outgoing) >>= edgesForLEdge
+    _ -> []
+
+  -- addEdgeConstraints traverses CNodes first, then each source's edges.
+  -- Preserve that order: simplex tie-breaking observes edge insertion order.
+  outgoing = foldl (\m edge -> M.insertWith (<>) edge.src [ edge ] m) M.empty routedEdges
 
   -- | ELK NetworkSimplexCompaction.java:199-289. One main edge per
   -- | LEdge pulling source-group → target-group with high weight,
@@ -512,7 +535,7 @@ applyLayout cg input =
   edgeEndpoints = M.fromFoldable (input.edges <#> \e -> e.id /\ (e.from.node /\ e.to.node))
 
   shiftPath ep = do
-    let segments' = shiftSegments ep.reversed ep.edge ep.segments
+    let segments' = shiftSegments ep.edge ep.segments
     ep
       { segments = segments'
       , bends = bendsFromSegments segments'
@@ -520,17 +543,15 @@ applyLayout cg input =
 
   bendsFromSegments segs = A.zipWith (\s _ -> s.end) segs (A.drop 1 segs)
 
-  -- `stitchChains` reverses segments for cycle-broken edges, so
-  -- segments[0].start sits geometrically at the original *target* and
-  -- segments[-1].end at the original *source*. Flip the deltas here
-  -- so each endpoint follows the node it's actually attached to.
-  shiftSegments reversed eid segments = case M.lookup eid edgeEndpoints of
+  -- Input paths are canonical: their first endpoint belongs to the
+  -- original source even when cycle breaking set `reversed`.
+  shiftSegments eid segments = case M.lookup eid edgeEndpoints of
     Nothing -> segments
     Just (src /\ tgt) -> do
       let srcD = fromMaybe 0.0 (M.lookup src nodeDeltas)
       let tgtD = fromMaybe 0.0 (M.lookup tgt nodeDeltas)
-      let firstDx = if reversed then tgtD else srcD
-      let lastDx = if reversed then srcD else tgtD
+      let firstDx = srcD
+      let lastDx = tgtD
       let n = A.length segments
       A.mapWithIndex (shiftOne firstDx lastDx n) segments
 

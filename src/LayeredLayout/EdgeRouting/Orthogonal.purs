@@ -1,4 +1,4 @@
-module LayeredLayout.EdgeRouting.Orthogonal (findRoute, findRouteSlot, simplifySegments, mergeCollinear, removeZeroLength, FineRect, ObstacleMap, buildObstacleMap, segmentsToObstacles) where
+module LayeredLayout.EdgeRouting.Orthogonal (findRoute, findRouteSlot, isRouteClear, simplifySegments, mergeCollinear, removeZeroLength, FineRect, ObstacleMap, buildObstacleMap, segmentsToObstacles) where
 
 import Prelude
 
@@ -316,14 +316,21 @@ mergeCollinear segs = case A.uncons segs of
   collapse current rest = case A.uncons rest of
     Nothing -> [ current ]
     Just { head: next, tail }
-      | sameDirection current next ->
+      | collinear current next ->
           collapse { start: current.start, end: next.end, direction: current.direction } tail
       | otherwise ->
           A.cons current (collapse next tail)
 
-  sameDirection a b = a.direction == b.direction && case a.direction of
-    H -> (gridX a.end - gridX a.start >= 0.0) == (gridX b.end - gridX b.start >= 0.0)
-    V -> (gridY a.end - gridY a.start >= 0.0) == (gridY b.end - gridY b.start >= 0.0)
+  -- A dummy-chain join can retrace the same axis. Retaining that reversal
+  -- leaves an axial bend with no transverse segment for the compactor to
+  -- move, so it stays behind when nearby CENTER boxes compact. Cancel the
+  -- redundant excursion, but never merge parallel runs on distinct tracks.
+  collinear a b = a.direction == b.direction && case a.direction of
+    H -> sameCoordinate (gridY a.start) (gridY b.start) && sameCoordinate (gridY a.end) (gridY b.end)
+    V -> sameCoordinate (gridX a.start) (gridX b.start) && sameCoordinate (gridX a.end) (gridX b.end)
+
+  sameCoordinate a b = abs (a - b) < 1.0e-6
+  abs n = if n < 0.0 then -n else n
 
 trySimplifyOnce :: ObstacleMap -> Array EdgeSegment -> Array EdgeSegment
 trySimplifyOnce obstacles segs = go 0
@@ -451,6 +458,11 @@ mergeSegments entry middle exit = case A.uncons middle of
         else front <> tail <> [ exit ]
 
 -- Obstacle intersection checks --
+
+isRouteClear :: ObstacleMap -> Array EdgeSegment -> Boolean
+isRouteClear obstacles = A.all \segment -> case segment.direction of
+  V -> not (vSegCrossesAny obstacles (gridY segment.start) (gridY segment.end) (gridX segment.start))
+  H -> not (hSegCrossesAny obstacles (gridX segment.start) (gridX segment.end) (gridY segment.start))
 
 vSegCrossesAny :: ObstacleMap -> Number -> Number -> Number -> Boolean
 vSegCrossesAny obstacles y1 y2 x = vSegCrossesRect (min y1 y2) (max y1 y2) x obstacles

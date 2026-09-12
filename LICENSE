@@ -1,3 +1,13 @@
+Layered Layout contains separately licensed source files.
+
+Original code is licensed under the MIT license below. Files marked
+SPDX-License-Identifier: EPL-2.0 contain translations of Eclipse ELK and
+are licensed under the Eclipse Public License 2.0; see LICENSE-EPL-2.0.
+Their individual copyright and upstream revision notices are retained.
+
+The ELK-derived source, including local modifications, is available under
+EPL-2.0 at https://github.com/markgrafhq/purescript-layered-layout.
+
 MIT License
 
 Copyright (c) 2026 Mark Eibes
