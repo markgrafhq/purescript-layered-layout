@@ -120,6 +120,7 @@ compactPostRouting
      , edges :: Array Edge
      , paths :: Array R.EdgePath
      , ports :: Map NodeId (Array Port)
+     , tailLabelOwners :: Map NodeId NodeId
      }
   -> { nodes :: Array R.NodePlacement, edges :: Array R.EdgePath, boundingBox :: GridRect }
 compactPostRouting strategy within spacings input = do
@@ -197,15 +198,21 @@ specialSpacings within spacings hooks =
 
   horizontalSpacing a b
     | hooks.sameEdgeVerticalSegments a b = 0.0
+    -- Source-owned end-label cells carry their exact clearance in the
+    -- hitbox and must not be treated as independent node rows.
+    | isTailLabel a || isTailLabel b = 0.0
     | a.kind == Just "label" && b.kind == Just "label" = within.edgeEdge
     | otherwise = pairSpacing a b
 
   verticalSpacing a b
     | hooks.sameEdgeVerticalSegments a b = 1.0
+    | isTailLabel a || isTailLabel b = 0.0
     | otherwise = case classify a b of
         NodeNode -> within.nodeNode
         EdgeNode -> 10.0 -- global SPACING_EDGE_NODE default; no adapter option
         EdgeEdge -> within.edgeEdge
+
+  isTailLabel node = node.kind == Just "tail-label"
 
 -- | Pair classification used by the spacings matrix below. Mirrors
 -- | ELK's `nodeTypeSpacingOptionsHorizontal` matrix (BETWEEN_LAYERS
@@ -240,6 +247,7 @@ swapInput
      , edges :: Array Edge
      , paths :: Array R.EdgePath
      , ports :: Map NodeId (Array Port)
+     , tailLabelOwners :: Map NodeId NodeId
      }
   -> TransformInput
 swapInput i =
@@ -247,6 +255,7 @@ swapInput i =
   , edges: i.edges
   , paths: i.paths <#> swapPath
   , ports: if all null i.ports then i.ports else i.ports <#> map swapPort
+  , tailLabelOwners: i.tailLabelOwners
   }
 
 swapPort :: Port -> Port

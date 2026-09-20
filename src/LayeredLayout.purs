@@ -27,13 +27,14 @@ import LayeredLayout.Compaction.HorizontalGraphCompactor (BetweenLayersSpacings,
 import LayeredLayout.Components as Components
 import LayeredLayout.EdgeRouting (routeAll)
 import LayeredLayout.EdgeRouting.HyperEdges (SlotInfo)
+import LayeredLayout.EdgeRouting.PortAssignment (EdgePortOffsets)
 import LayeredLayout.EdgeLabels as EdgeLabels
 import LayeredLayout.EdgeLabels.SelfLoops as SelfLoops
 import LayeredLayout.EdgeRouting.LineJump (detectJumps)
 import LayeredLayout.EdgeRouting.Orthogonal (mergeCollinear, removeZeroLength)
 import LayeredLayout.PortDistribution as PortDistribution
 import LayeredLayout.PortDummies as PortDummies
-import LayeredLayout.Graph (EdgeId(..), Graph, NodeId(..), Side(..))
+import LayeredLayout.Graph (Edge, EdgeId(..), Graph, NodeId(..), Side(..))
 import LayeredLayout.Grid (GridPos(..), GridRect, GridSize(..), gridX, gridY, sizeH, sizeW)
 import LayeredLayout.JavaRandom (Random, mkRandom)
 import LayeredLayout.CoordAssignment as CoordAssignment
@@ -56,7 +57,10 @@ type Config =
   -- Between-layer compaction spacings, in fine/router units. Within-layer
   -- node spacing comes from nodeGap; within-layer edge spacing is ELK's 10.
   , compactionSpacings :: BetweenLayersSpacings
-  , edgeLabelSizes :: M.Map EdgeId GridSize
+  , edgeLabels :: M.Map EdgeId EdgeLabels.EdgeLabelSpec
+  -- Painted renderer outsets in FINE/router units. They reserve layout space
+  -- without changing the public physical node rectangles or port anchors.
+  , nodeVisualMargins :: CoordAssignment.NodeMargins
   }
 
 defaultConfig :: Config
@@ -74,7 +78,8 @@ defaultConfig =
   , cycleBreaker: CycleRemoval.Greedy
   , compactPostRouting: true
   , compactionSpacings: defaultBetweenLayersSpacings
-  , edgeLabelSizes: M.empty
+  , edgeLabels: M.empty
+  , nodeVisualMargins: M.empty
   }
 
 -- | Cached intermediate results from each pipeline phase.
@@ -95,6 +100,8 @@ type Pipeline =
   , placements :: Array NodePlacement
   , labels :: EdgeLabels.LabelState
   , loops :: SelfLoops.LoopState
+  , tailCells :: EdgeLabels.TailCells
+  , visualMargins :: CoordAssignment.NodeMargins
   }
 
 -- Component frames are reversible: cached placements use packed coordinates,
@@ -132,17 +139,17 @@ fullConnected :: Random -> Config -> Graph -> LayoutOutput
 fullConnected initialRandom cfg graph = fromDummies cfg graph pipeline
   where
   acyclic = CycleRemoval.makeAcyclicWithOrder cfg.cycleBreaker allNodeIds graph.constraints regularEdges
-  labels = EdgeLabels.insert cfg.edgeLabelSizes graph acyclic.edges
+  labels = EdgeLabels.insert cfg.edgeLabels graph acyclic.edges
   layeredIds = if A.null labels.nodes then allNodeIds else allNodeIds <> (labels.nodes <#> _.id)
   layered = LayerAssignment.assignLayersWith cfg.layerer graph.constraints labels.edges layeredIds
-  pipeline = { acyclic, layered, labels, loops: SelfLoops.empty, components: [], initialRandom, random: initialRandom, routedRandom: initialRandom, portOrder: M.empty, portDummies: PortDummies.empty, withDummies: dummyPlaceholder, ordered: [], placements: [] }
+  pipeline = { acyclic, layered, labels, loops: SelfLoops.empty, tailCells: { cells: [], margins: M.empty }, visualMargins: cfg.nodeVisualMargins, components: [], initialRandom, random: initialRandom, routedRandom: initialRandom, portOrder: M.empty, portDummies: PortDummies.empty, withDummies: dummyPlaceholder, ordered: [], placements: [] }
   allNodeIds = graph.nodes <#> _.id
   -- SelfLoopPreProcessor removes these before cycle removal and layering.
   regularEdges = A.filter (\e -> e.from.node /= e.to.node) graph.edges
 
 -- | Rerun from dummy node insertion (node moved to different layer).
 fromDummies :: Config -> Graph -> Pipeline -> LayoutOutput
-fromDummies cfg graph pipeline | cfg.edgeLabelSizes /= pipeline.labels.sizes = full cfg graph
+fromDummies cfg graph pipeline | cfg.edgeLabels /= pipeline.labels.specs || cfg.nodeVisualMargins /= pipeline.visualMargins = full cfg graph
 fromDummies cfg graph pipeline | not (A.null pipeline.components) = rerunComponents fromDummies cfg graph pipeline
 fromDummies cfg graph pipeline = fromCrossMin cfg graph pipeline'
   where
@@ -152,7 +159,7 @@ fromDummies cfg graph pipeline = fromCrossMin cfg graph pipeline'
 
 -- | Rerun from crossing minimization (node order changed).
 fromCrossMin :: Config -> Graph -> Pipeline -> LayoutOutput
-fromCrossMin cfg graph pipeline | cfg.edgeLabelSizes /= pipeline.labels.sizes = full cfg graph
+fromCrossMin cfg graph pipeline | cfg.edgeLabels /= pipeline.labels.specs || cfg.nodeVisualMargins /= pipeline.visualMargins = full cfg graph
 fromCrossMin cfg graph pipeline | not (A.null pipeline.components) = rerunComponents fromCrossMin cfg graph pipeline
 fromCrossMin cfg graph pipeline = fromCoords cfg graph pipeline'
   where
@@ -182,7 +189,7 @@ fromCrossMin cfg graph pipeline = fromCoords cfg graph pipeline'
 
 -- | Rerun from coordinate assignment (node size or constraint changed).
 fromCoords :: Config -> Graph -> Pipeline -> LayoutOutput
-fromCoords cfg graph pipeline | cfg.edgeLabelSizes /= pipeline.labels.sizes = full cfg graph
+fromCoords cfg graph pipeline | cfg.edgeLabels /= pipeline.labels.specs || cfg.nodeVisualMargins /= pipeline.visualMargins = full cfg graph
 fromCoords cfg graph pipeline | not (A.null pipeline.components) = rerunComponents fromCoords cfg graph pipeline
 fromCoords cfg graph pipeline = do
   let switched = EdgeLabels.switchDummies pipeline.labels (pipeline.withDummies { layers = pipeline.ordered })
@@ -198,37 +205,40 @@ fromCoords cfg graph pipeline = do
             byId = M.fromFoldable (graph.nodes <#> \n -> n.id /\ n)
             loopOwners = A.mapMaybe (\id -> M.lookup id byId) (A.concat dummies.layers)
           in
-            SelfLoops.prepare pipeline.random cfg.edgeLabelSizes
+            SelfLoops.prepare pipeline.random cfg.edgeLabels
               (graph { nodes = loopOwners, edges = pipeline.acyclic.edges <> loopEdges })
   let prepared = pipeline { labels = labels, loops = loops, withDummies = dummies, ordered = dummies.layers, portOrder = portOrder }
   let portNodes = graph.nodes <> (pipeline.portDummies.dummies <#> _.node)
   let sizedNodes = portNodes <> labels.nodes
-  let sizeMap = M.fromFoldable (sizedNodes <#> \n -> n.id /\ n.size)
+  let physicalSizes = M.fromFoldable (sizedNodes <#> \n -> n.id /\ n.size)
   let portMap = M.fromFoldable (portNodes <#> \n -> n.id /\ n.ports)
   let
-    portOffsets = SelfLoops.portOffsets SelfLoops.ReservedFrame loops prepared.withDummies.edges
+    rawPortOffsets = SelfLoops.portOffsets loops prepared.withDummies.edges
       $ EdgeLabels.portOffsets labels prepared.withDummies.edges
-      $
-        PortDistribution.distributePorts prepared.portOrder prepared.ordered prepared.withDummies.edges (toFineSize sizeMap)
+      $ PortDistribution.distributePorts prepared.portOrder prepared.ordered prepared.withDummies.edges (toFineSize physicalSizes)
+  let tailCells = EdgeLabels.prepareTailCells cfg.nodeVisualMargins graph labels prepared.withDummies.chains rawPortOffsets physicalSizes
+  let frameMargins = mergeMargins [ cfg.nodeVisualMargins, tailCells.margins, SelfLoops.margins loops ]
+  let reservedSizes = reserveNodes frameMargins physicalSizes
+  let portOffsets = shiftPortOffsets frameMargins prepared.withDummies.edges rawPortOffsets
   let
     assigned = CoordAssignment.assign
       (SelfLoops.afterRouting prepared.random loops)
       { nodeGap: cfg.nodeGap, layerGap: cfg.layerGap }
       graph.constraints
       prepared.ordered
-      (SelfLoops.reserveNodes loops sizeMap)
-      (SelfLoops.margins loops)
+      reservedSizes
+      frameMargins
       portMap
       prepared.withDummies.edges
       prepared.withDummies.chains
       portOffsets
-  let pipeline' = prepared { placements = assigned.placements, routedRandom = assigned.random }
+  let pipeline' = prepared { placements = assigned.placements, routedRandom = assigned.random, tailCells = tailCells }
   let result = finalize cfg graph pipeline' (Just assigned.slots)
   { pipeline: pipeline', result }
 
 -- | Rerun edge routing only (node position changed, same order).
 fromRouting :: Config -> Graph -> Pipeline -> LayoutResult
-fromRouting cfg graph pipeline | cfg.edgeLabelSizes /= pipeline.labels.sizes = (full cfg graph).result
+fromRouting cfg graph pipeline | cfg.edgeLabels /= pipeline.labels.specs || cfg.nodeVisualMargins /= pipeline.visualMargins = (full cfg graph).result
 fromRouting cfg graph pipeline | not (A.null pipeline.components) =
   (rerunComponents (\config component cache -> { pipeline: cache, result: fromRouting config component cache }) cfg graph pipeline).result
 fromRouting cfg graph pipeline = finalize cfg graph pipeline Nothing
@@ -282,7 +292,11 @@ componentPipeline component pipeline = pipeline
       , nodes = A.filter (member <<< _.id) pipeline.labels.nodes
       , edges = A.filter memberEdge pipeline.labels.edges
       }
-  , loops = SelfLoops.restrict component.nodes pipeline.loops
+  , tailCells =
+      { cells: A.filter (member <<< _.source) pipeline.tailCells.cells
+      , margins: M.filterKeys member pipeline.tailCells.margins
+      }
+  , visualMargins = pipeline.visualMargins
   }
   where
   slice = A.slice component.layerOffset (component.layerOffset + component.layerCount)
@@ -343,7 +357,17 @@ combineComponents cfg graph outputs = case A.uncons framed of
         , portOrder = M.union a.portOrder b.portOrder
         , portDummies = { dummies: a.portDummies.dummies <> b.portDummies.dummies }
         , placements = a.placements <> b.placements
-        , labels = a.labels { dummies = a.labels.dummies <> b.labels.dummies, nodes = a.labels.nodes <> b.labels.nodes, edges = a.labels.edges <> b.labels.edges }
+        , labels = a.labels
+            { reservations = M.union a.labels.reservations b.labels.reservations
+            , dummies = a.labels.dummies <> b.labels.dummies
+            , nodes = a.labels.nodes <> b.labels.nodes
+            , edges = a.labels.edges <> b.labels.edges
+            }
+        , tailCells =
+            { cells: a.tailCells.cells <> b.tailCells.cells
+            , margins: M.union a.tailCells.margins b.tailCells.margins
+            }
+        , visualMargins = a.visualMargins
         , loops = a.loops <> b.loops
         }
       result = left.result
@@ -393,25 +417,27 @@ finalize cfg graph pipeline slotPlan = do
   let portNodes = graph.nodes <> (pipeline.portDummies.dummies <#> _.node)
   let portMap = M.fromFoldable (portNodes <#> \n -> n.id /\ n.ports)
   let sizedNodes = portNodes <> pipeline.labels.nodes
-  let sizeMap = M.fromFoldable (sizedNodes <#> \n -> n.id /\ n.size)
-  -- NodeRelativePortDistributor places regular ports alongside restored loop
-  -- sectors. Routing uses actual owner coordinates, not BK's reserved frame.
+  let physicalSizes = M.fromFoldable (sizedNodes <#> \n -> n.id /\ n.size)
+  let coordinateMargins = mergeMargins [ cfg.nodeVisualMargins, pipeline.tailCells.margins, SelfLoops.margins pipeline.loops ]
+  -- Tail envelopes exist solely to make pre-coordinate routing slots feasible.
+  -- Post-routing compaction sees the painted/loop owner frame plus the actual
+  -- measured tail cells, never unused source-envelope padding.
+  let compactionMargins = mergeMargins [ cfg.nodeVisualMargins, SelfLoops.margins pipeline.loops ]
   let
-    portOffsets = SelfLoops.portOffsets SelfLoops.OwnerFrame pipeline.loops pipeline.withDummies.edges
+    portOffsets = SelfLoops.portOffsets pipeline.loops pipeline.withDummies.edges
       $ EdgeLabels.portOffsets pipeline.labels pipeline.withDummies.edges
-      $ PortDistribution.distributePorts pipeline.portOrder pipeline.ordered pipeline.withDummies.edges (toFineSize sizeMap)
+      $ PortDistribution.distributePorts pipeline.portOrder pipeline.ordered pipeline.withDummies.edges (toFineSize physicalSizes)
   let portDummyIds = S.fromFoldable (pipeline.portDummies.dummies <#> _.node.id)
-  let realPlacements = A.filter (\p -> not (DummyNodes.isDummy p.node || S.member p.node portDummyIds)) pipeline.placements
-  -- Per-segment routing: route each broken-up dummy edge against the full
-  -- placements (so dummies act as obstacles for unrelated edges), then
-  -- stitch the routed segments back into a single path per chain. This
-  -- is the path of `BaseRoutingDirectionStrategy.getPortPositionOnHyperNode`
-  -- (port-position sharing through dummies, handled inside `assignPorts`)
-  -- combined with ELK's chain assembly. Reversed back-edges are stitched
-  -- in reversed order with each segment's endpoints flipped so the
-  -- rendered direction matches the original edge.
-  let restoredPlacements = SelfLoops.restoreNodes pipeline.loops pipeline.placements
-  let obstacles = SelfLoops.routingObstacles pipeline.loops pipeline.placements restoredPlacements
+  let restoredPlacements = restoreFrame coordinateMargins physicalSizes pipeline.placements
+  let compactionPlacements = reserveFrame compactionMargins physicalSizes restoredPlacements
+  let realPlacements = A.filter (\p -> not (DummyNodes.isDummy p.node || S.member p.node portDummyIds)) compactionPlacements
+  let tailReservations = EdgeLabels.routingObstacles pipeline.tailCells restoredPlacements
+  let obstacles = SelfLoops.routingObstacles pipeline.loops pipeline.placements restoredPlacements <> tailReservations
+  let
+    tailLabelOwners = M.fromFoldable $ A.mapMaybe
+      (\edge -> M.lookup edge.id pipeline.labels.reservations <#> \reservation -> reservation /\ edge.from.node)
+      graph.edges
+
   let
     segmentPaths = PortDummies.restore pipeline.portDummies restoredPlacements pipeline.withDummies.edges
       (routeAll (SelfLoops.afterRouting pipeline.random pipeline.loops) slotPlan pipeline.withDummies.edges restoredPlacements obstacles portMap pipeline.withDummies.chains portOffsets)
@@ -421,33 +447,26 @@ finalize cfg graph pipeline slotPlan = do
   let loopEdges = A.filter (\edge -> edge.from.node == edge.to.node) graph.edges
   let routingEdges = regularRoutingEdges <> loopEdges
   let originalKeyById = M.fromFoldable (regularRoutingEdges <#> \edge -> edge.id /\ (edge.from.node /\ edge.to.node))
-  let
-    stitched = stitchChains pipeline.withDummies.chains originalKeyById segmentPaths
-      <> SelfLoops.route pipeline.loops restoredPlacements
+  let stitched = stitchChains pipeline.withDummies.chains originalKeyById segmentPaths <> SelfLoops.route pipeline.loops restoredPlacements
   let
     compacted =
       if cfg.compactPostRouting then
         compactPostRouting EdgeLength { nodeNode: 4.0 * toNumber cfg.nodeGap, edgeEdge: 10.0 } cfg.compactionSpacings
-          { nodes: realPlacements
+          { nodes: realPlacements <> tailReservations
           , edges: routingEdges
           , paths: stitched
           , ports: portMap
+          , tailLabelOwners
           }
       else
-        { nodes: realPlacements
+        { nodes: realPlacements <> tailReservations
         , edges: stitched
-        , boundingBox: Components.bounds { nodes: realPlacements, edges: stitched, edgeLabels: [] }
+        , boundingBox: Components.bounds { nodes: realPlacements <> tailReservations, edges: stitched, edgeLabels: [] }
         }
-  let
-    retainedNodes =
-      if hasCenterLabels then
-        let
-          realIds = S.fromFoldable (graph.nodes <#> _.id)
-        in
-          A.filter (\p -> S.member p.node realIds) compacted.nodes
-      else compacted.nodes
-  let nodes = SelfLoops.restoreNodes pipeline.loops retainedNodes
-  let edgeLabels = EdgeLabels.placements pipeline.labels compacted.nodes <> SelfLoops.placements pipeline.loops nodes
+  let realIds = S.fromFoldable (graph.nodes <#> _.id)
+  let retainedNodes = A.filter (\p -> S.member p.node realIds) compacted.nodes
+  let nodes = restoreFrame compactionMargins physicalSizes retainedNodes
+  let centerLabels = EdgeLabels.placements pipeline.labels compacted.nodes
   let restored = EdgeLabels.restore pipeline.labels compacted.edges
   let
     oriented =
@@ -467,8 +486,13 @@ finalize cfg graph pipeline slotPlan = do
       in
         p { segments = segs, bends = A.zipWith (\s _ -> s.end) segs (A.drop 1 segs) }
   let withJumps = detectJumps simplified
+  let loopLabels = SelfLoops.placements pipeline.loops nodes
+  let tailFallbacks = EdgeLabels.reservedPlacements graph pipeline.labels compacted.nodes
+  let tailLabels = EdgeLabels.tailPlacements cfg.nodeVisualMargins graph pipeline.labels nodes withJumps tailFallbacks (centerLabels <> loopLabels)
+  let edgeLabels = centerLabels <> loopLabels <> tailLabels
   let metrics = allMetrics nodes withJumps 0
-  { nodes, edges: withJumps, edgeLabels, boundingBox: compacted.boundingBox, metrics }
+  let paintedBounds = Components.bounds { nodes, edges: withJumps, edgeLabels }
+  { nodes, edges: withJumps, edgeLabels, boundingBox: unionBounds compacted.boundingBox paintedBounds, metrics }
 
 stitchChains
   :: Array { edgeId :: EdgeId, nodes :: Array NodeId }
@@ -526,6 +550,73 @@ reverseSegments = A.reverse <<< map flipEnds
 
 dummyPlaceholder :: DummyNodes.DummyResult
 dummyPlaceholder = { layers: [], edges: [], chains: [] }
+
+type FrameMargin =
+  { left :: Number
+  , right :: Number
+  , top :: Number
+  , bottom :: Number
+  }
+
+-- | Reservations share the same physical origin. Union outward extents instead
+-- | of adding unrelated frames, so a visual lip and a loop sector on the same
+-- | side do not inflate node output or double-count clearance.
+mergeMargins :: Array CoordAssignment.NodeMargins -> CoordAssignment.NodeMargins
+mergeMargins = foldl merge M.empty
+  where
+  merge acc next = foldl add acc (M.toUnfoldable next :: Array (NodeId /\ FrameMargin))
+  add acc (node /\ next) = M.insertWith union node next acc
+  union a b =
+    { left: max a.left b.left
+    , right: max a.right b.right
+    , top: max a.top b.top
+    , bottom: max a.bottom b.bottom
+    }
+
+reserveNodes :: CoordAssignment.NodeMargins -> M.Map NodeId GridSize -> M.Map NodeId GridSize
+reserveNodes margins sizes = foldl reserve sizes (M.toUnfoldable margins :: Array (NodeId /\ FrameMargin))
+  where
+  reserve acc (node /\ margin) = M.update
+    (\size -> Just (GridSize ((sizeW size + (margin.left + margin.right) / 4.0) /\ (sizeH size + (margin.top + margin.bottom) / 4.0))))
+    node
+    acc
+
+-- | Rebuild a chosen compaction frame around already restored physical nodes.
+-- | Coordinate-only tail envelopes are deliberately excluded from this frame.
+reserveFrame :: CoordAssignment.NodeMargins -> M.Map NodeId GridSize -> Array NodePlacement -> Array NodePlacement
+reserveFrame margins sizes = map reserve
+  where
+  reserve placement = case M.lookup placement.node margins, M.lookup placement.node sizes of
+    Just margin, Just size ->
+      placement
+        { position = GridPos ((gridX placement.position - margin.left / 4.0) /\ (gridY placement.position - margin.top / 4.0))
+        , size = GridSize ((sizeW size + (margin.left + margin.right) / 4.0) /\ (sizeH size + (margin.top + margin.bottom) / 4.0))
+        }
+    _, _ -> placement
+
+restoreFrame :: CoordAssignment.NodeMargins -> M.Map NodeId GridSize -> Array NodePlacement -> Array NodePlacement
+restoreFrame margins sizes = map restore
+  where
+  restore placement = case M.lookup placement.node margins, M.lookup placement.node sizes of
+    Just margin, Just size ->
+      placement
+        { position = GridPos ((gridX placement.position + margin.left / 4.0) /\ (gridY placement.position + margin.top / 4.0))
+        , size = size
+        }
+    _, _ -> placement
+
+-- | BK sees the reserved frame, so ordinary port offsets are translated from
+-- | their physical owner frame by the corresponding leading outset. The final
+-- | router deliberately uses unshifted physical offsets.
+shiftPortOffsets :: CoordAssignment.NodeMargins -> Array Edge -> EdgePortOffsets -> EdgePortOffsets
+shiftPortOffsets margins edges initialOffsets = foldl shift initialOffsets edges
+  where
+  leading node = case M.lookup node margins of
+    Just margin -> margin.left
+    Nothing -> 0.0
+  shift offsets edge =
+    M.update (Just <<< (_ + leading edge.from.node)) (edge.id /\ South)
+      (M.update (Just <<< (_ + leading edge.to.node)) (edge.id /\ North) offsets)
 
 -- | Convert a grid-unit `sizeMap` to fine units (× sf=4) so it matches
 -- | what the BK pass works with internally.

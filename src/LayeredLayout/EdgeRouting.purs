@@ -27,10 +27,18 @@ scaleFactor = PA.scaleFactor
 routeAll :: Random -> Maybe (Map EdgeId SlotInfo) -> Array Edge -> Array NodePlacement -> Array NodePlacement -> Map NodeId (Array Port) -> Array { edgeId :: EdgeId, nodes :: Array NodeId } -> EdgePortOffsets -> Array EdgePath
 routeAll random planned edges placements obstaclePlacements portMap chains portOffsets = selfLoopPaths <>
   if trustedPlan then
+    -- Slot plans preserve their short two-bend channels, but independent
+    -- label hitboxes must still be checked. Endpoint owner rectangles are
+    -- filtered; synthetic end-label obstacles intentionally are not.
     let
-      noObstacles = []
+      nodeObstacles = buildObstacleMap obstaclePlacements
+      posMap = foldl (\m p -> M.insert p.node p m) M.empty obstaclePlacements
     in
-      map (routeAssigned noObstacles noObstacles) ordered
+      ordered <#> \assignment ->
+        let
+          filteredNodeObs = filteredFor assignment nodeObstacles posMap
+        in
+          routeAssigned filteredNodeObs filteredNodeObs assignment
   else
     let
       -- Unplanned and manually moved layouts still need obstacle-aware routing.

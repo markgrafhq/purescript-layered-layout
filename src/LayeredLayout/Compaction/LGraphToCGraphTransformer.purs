@@ -78,6 +78,9 @@ type TransformInput =
   , edges :: Array Edge
   , paths :: Array R.EdgePath
   , ports :: Map NodeId (Array Port)
+  -- End-label cells are children of their authored source's compaction group.
+  -- Their master-relative offset remains intact while the group compacts.
+  , tailLabelOwners :: Map NodeId NodeId
   }
 
 type TransformOutput =
@@ -94,7 +97,7 @@ type TransformOutput =
 transform :: TransformInput -> TransformOutput
 transform input = do
   let degrees = edgeDegrees input.edges
-  let withNodes = transformNodes degrees input.nodes (initial input)
+  let withNodes = transformNodes input.tailLabelOwners degrees input.nodes (initial input)
   let routed = buildRoutedEdges input
   transformEdges input.edges routed withNodes
 
@@ -116,16 +119,26 @@ edgeDegrees edges = foldl tally M.empty edges
       (M.insertWith addPair e.from.node (0 /\ 1) acc)
   addPair (a /\ b) (c /\ d) = (a + c) /\ (b + d)
 
-transformNodes :: Map NodeId (Int /\ Int) -> Array R.NodePlacement -> TransformOutput -> TransformOutput
-transformNodes degrees nodes out = foldl placeNode out nodes
+transformNodes :: Map NodeId NodeId -> Map NodeId (Int /\ Int) -> Array R.NodePlacement -> TransformOutput -> TransformOutput
+transformNodes tailLabelOwners degrees nodes out = foldl placeNode out nodes
   where
   placeNode acc np = do
-    let added = addCNode { origin: Just (NodeOrigin np.node), kind: if isLabelDummy np.node then Just "label" else Nothing, hitbox: hitboxFor np } acc.cGraph
-    let group = addCGroup { master: Just added.id, nodes: [ added.id ] } added.graph
+    let kind = if M.member np.node tailLabelOwners then Just "tail-label" else if isLabelDummy np.node then Just "label" else Nothing
+    let added = addCNode { origin: Just (NodeOrigin np.node), kind, hitbox: hitboxFor np } acc.cGraph
+    let
+      ownerGroup = do
+        owner <- M.lookup np.node tailLabelOwners
+        parentId <- M.lookup owner acc.nodeToC
+        parent <- lookupCNode parentId added.graph
+        parent.cGroup
+    let
+      grouped = case ownerGroup of
+        Just gid -> addCNodeToGroup added.id gid added.graph
+        Nothing -> (addCGroup { master: Just added.id, nodes: [ added.id ] } added.graph).graph
     let inc /\ outd = fromMaybe (0 /\ 0) (M.lookup np.node degrees)
     let lock = nodeLockFor (inc - outd)
     acc
-      { cGraph = group.graph
+      { cGraph = grouped
       , nodeToC = M.insert np.node added.id acc.nodeToC
       , lockMap = M.insert added.id lock acc.lockMap
       }

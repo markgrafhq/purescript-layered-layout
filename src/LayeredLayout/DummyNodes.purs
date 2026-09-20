@@ -65,3 +65,4 @@ isDummy nid = Str.take 3 (un NodeId nid) == "$d:"
 
 isLabelDummy :: NodeId -> Boolean
 isLabelDummy nid = Str.take 7 (un NodeId nid) == "$label:"
+

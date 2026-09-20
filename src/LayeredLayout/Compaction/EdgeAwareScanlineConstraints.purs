@@ -224,11 +224,10 @@ projectGroupMasters filt g found = foldl projectSource found
   (M.toUnfoldable found :: Array (CNodeId /\ Array CNodeId))
   where
   projectSource acc (sourceId /\ targets) = case lookupCNode sourceId g of
-    Nothing -> acc
     Just source -> foldl (projectTarget source (masterFor source)) acc targets
+    Nothing -> acc
 
   projectTarget source sourceMaster acc targetId = case lookupCNode targetId g of
-    Nothing -> acc
     Just target ->
       let
         targetMaster = masterFor target
@@ -242,6 +241,7 @@ projectGroupMasters filt g found = foldl projectSource found
         case sourceMaster, targetMaster of
           Just a, Just b -> add a b withTarget
           _, _ -> withTarget
+    Nothing -> acc
 
   masterFor node = do
     groupId <- node.cGroup

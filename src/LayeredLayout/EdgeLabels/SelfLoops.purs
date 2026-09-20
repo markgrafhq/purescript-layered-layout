@@ -15,20 +15,17 @@
 -- boxes, and margins back; only node reservations are divided by four.
 --
 -- Node reservations encode ELK LMargin in this engine's rectangular node-size
--- model. Independent label obstacles are an adapter concern: the A* router
--- excludes endpoint owners, whereas ELK's layered router respects their margins.
+-- model. Loop-label hitboxes stay independent obstacles: endpoint owner
+-- filtering must not permit another route through a painted loop label.
 -- They duplicate exact label boxes, never enlarge or relocate loop geometry.
 module LayeredLayout.EdgeLabels.SelfLoops
   ( LoopState
-  , PortFrame(..)
   , empty
   , restrict
   , afterRouting
   , prepare
-  , reserveNodes
   , margins
   , portOffsets
-  , restoreNodes
   , routingObstacles
   , route
   , placements
@@ -44,15 +41,14 @@ import Data.Maybe (Maybe(..), fromMaybe)
 import Data.Newtype (un)
 import Data.Set as S
 import Data.Tuple.Nested ((/\))
-import LayeredLayout.EdgeLabels.SelfLoops.Model (Margin, Point, PortKey(..), Size, makeHolder, transposeSide)
+import LayeredLayout.EdgeLabels (EdgeLabelSpec, LabelPlacement(..))
+import LayeredLayout.EdgeLabels.SelfLoops.Model (Holder, Margin, Point, PortKey(..), Size, includePoint, makeHolder, transposeSide, zeroMargin)
 import LayeredLayout.EdgeLabels.SelfLoops.Routing (Geometry, compute)
 import LayeredLayout.Graph (Edge, EdgeId(..), Graph, NodeId(..), Side(..))
 import LayeredLayout.Grid (GridPos(..), GridSize(..), gridX, gridY, sizeH, sizeW)
 import LayeredLayout.JavaRandom (Random)
 import LayeredLayout.PortDistribution (EdgePortOffsets)
 import LayeredLayout.Result (Direction(..), EdgeLabelPlacement, EdgePath, NodePlacement)
-
-data PortFrame = OwnerFrame | ReservedFrame
 
 type Owner =
   { node :: NodeId
@@ -93,13 +89,21 @@ margins (LoopState { owners }) = M.fromFoldable (owners <#> \owner -> owner.node
 -- must be excluded from the regular dummy/routing pipeline, even when unlabelled.
 -- The supplied JavaRandom is the crossing minimizer's final state; it is threaded
 -- across owners exactly as SelfLoopRouter processes the graph's node sequence.
-prepare :: Random -> Map EdgeId GridSize -> Graph -> LoopState
-prepare random sizes graph =
+prepare :: Random -> Map EdgeId EdgeLabelSpec -> Graph -> LoopState
+prepare random specs graph =
   let
     state = foldl add { owners: [], random } graph.nodes
   in
     LoopState { owners: state.owners, random: Just state.random }
   where
+  -- Self-loop geometry owns CENTER label sectors. Explicit TAIL labels are
+  -- finalized from their authored route instead.
+  sizes = M.mapMaybeWithKey
+    ( \_ spec -> case spec.placement of
+        Center -> Just spec.size
+        Tail _ -> Nothing
+    )
+    specs
   incident = foldl
     ( \m e ->
         let
@@ -114,7 +118,8 @@ prepare random sizes graph =
   add state node =
     let
       holder = makeHolder sizes node (fromMaybe [] (M.lookup node.id incident))
-      geometry /\ random' = compute state.random holder
+      rawGeometry /\ random' = compute state.random holder
+      geometry = repairGeometry holder rawGeometry
       m = geometry.margin
       margin = { left: m.top, right: m.bottom, top: m.left, bottom: m.right }
       regularPorts = foldl collect M.empty holder.ports <#> A.sort
@@ -130,23 +135,12 @@ prepare random sizes graph =
     in
       { owners: A.snoc state.owners owner, random: random' }
 
-reserveNodes :: LoopState -> Map NodeId GridSize -> Map NodeId GridSize
-reserveNodes (LoopState { owners }) sizes = foldl reserve sizes owners
-  where
-  reserve acc o = M.insert o.node
-    ( GridSize
-        ( (sizeW o.size + (o.margin.left + o.margin.right) / 4.0) /\
-            (sizeH o.size + (o.margin.top + o.margin.bottom) / 4.0)
-        )
-    )
-    acc
-
 -- PortRestorer's loop sectors also move ordinary automatic ports on the same
 -- side. Preserve their crossing-minimized order from the supplied offset map,
--- but distribute them into the restored side's regular-port slots. BK needs
--- ReservedFrame; regular routing against restored nodes needs OwnerFrame.
-portOffsets :: PortFrame -> LoopState -> Array Edge -> EdgePortOffsets -> EdgePortOffsets
-portOffsets frame (LoopState { owners }) edges offsets = foldl perOwner offsets owners
+-- but distribute them into the restored side's regular-port slots. The caller
+-- translates those physical offsets into any reserved assignment frame.
+portOffsets :: LoopState -> Array Edge -> EdgePortOffsets -> EdgePortOffsets
+portOffsets (LoopState { owners }) edges offsets = foldl perOwner offsets owners
   where
   perOwner acc o = foldl (onSide o) acc [ North, South, East, West ]
   onSide o acc side = foldl assign acc (A.mapWithIndex (/\) sorted)
@@ -164,23 +158,9 @@ portOffsets frame (LoopState { owners }) edges offsets = foldl perOwner offsets 
       else []
     sorted = A.sortBy (\a b -> compare (M.lookup (a.id /\ side) offsets) (M.lookup (b.id /\ side) offsets)) relevant
     slots = fromMaybe [] (M.lookup side o.regularPorts)
-    displacement = case frame of
-      OwnerFrame -> 0.0
-      ReservedFrame -> if side == North || side == South then o.margin.left else o.margin.top
     assign m (i /\ e) = case A.index slots i of
-      Just offset -> M.insert (e.id /\ side) (offset + displacement) m
-      Nothing -> M.update (\offset -> Just (offset + displacement)) (e.id /\ side) m
-
-restoreNodes :: LoopState -> Array NodePlacement -> Array NodePlacement
-restoreNodes (LoopState { owners: [] }) nodes = nodes
-restoreNodes (LoopState { owners }) nodes = nodes <#> \n -> case M.lookup n.node byNode of
-  Nothing -> n
-  Just o -> n
-    { position = GridPos ((gridX n.position + o.margin.left / 4.0) /\ (gridY n.position + o.margin.top / 4.0))
-    , size = o.size
-    }
-  where
-  byNode = M.fromFoldable (owners <#> \o -> o.node /\ o)
+      Just offset -> M.insert (e.id /\ side) offset m
+      Nothing -> M.update (\offset -> Just offset) (e.id /\ side) m
 
 routingObstacles :: LoopState -> Array NodePlacement -> Array NodePlacement -> Array NodePlacement
 routingObstacles (LoopState { owners: [] }) reserved _ = reserved
@@ -234,7 +214,133 @@ placements (LoopState { owners }) nodes = A.concatMap place owners
   byNode = M.fromFoldable (nodes <#> \node -> node.node /\ node)
   place owner = case M.lookup owner.node byNode of
     Nothing -> []
-    Just node -> map (placeLabel node) owner.geometry.labels
+    Just node -> owner.geometry.labels <#> placeLabel node
+
+-- | Four-sided fixed-port hyperloops can contain labels whose shared ELK label
+-- | sector is on a different side from their own route. Repair only labels
+-- | that do not run beside a positive-length projection of their own route.
+
+repairGeometry :: Holder -> Geometry -> Geometry
+repairGeometry holder geometry =
+  let
+    labels = repairLabels holder.size geometry.paths geometry.labels
+    points =
+      (holder.ports <#> _.position)
+        <> A.concatMap _.points geometry.paths
+        <> A.concatMap (\label -> [ label.position, { x: label.position.x + label.size.width, y: label.position.y + label.size.height } ]) labels
+  in
+    geometry { labels = labels, margin = foldl (includePoint holder.size) zeroMargin points }
+
+repairLabels
+  :: Size
+  -> Array { edge :: EdgeId, points :: Array Point }
+  -> Array { edge :: EdgeId, position :: Point, size :: Size }
+  -> Array { edge :: EdgeId, position :: Point, size :: Size }
+repairLabels node paths labels = _.placed (foldl repair { placed: [] } labels)
+  where
+  pathByEdge = M.fromFoldable (paths <#> \path -> path.edge /\ path.points)
+  fixed = A.filter
+    ( \label -> case M.lookup label.edge pathByEdge of
+        Just points -> associated label points
+        Nothing -> true
+    )
+    labels
+  repair state label =
+    let
+      repaired = case M.lookup label.edge pathByEdge of
+        Just points | not (associated label points) ->
+          fromMaybe label (A.find (clear label state.placed) (candidates label points))
+        _ -> label
+    in
+      state { placed = A.snoc state.placed repaired }
+  clear original placed label =
+    clearNode node label
+      && not (A.any (overlaps label) (placed <> A.filter (\fixedLabel -> fixedLabel.edge /= original.edge) fixed))
+      && not (A.any (\path -> path.edge /= original.edge && crosses label path.points) paths)
+
+labelGap :: Number
+labelGap = 2.0
+
+associated :: forall r. { position :: Point, size :: Size | r } -> Array Point -> Boolean
+associated label points = A.any near (A.zip points (A.drop 1 points))
+  where
+  near (start /\ end)
+    | start.x == end.x =
+        rangeDistance start.x label.position.x (label.position.x + label.size.width) <= labelGap
+          && positiveOverlap (min start.y end.y) (max start.y end.y) label.position.y (label.position.y + label.size.height)
+    | otherwise =
+        rangeDistance start.y label.position.y (label.position.y + label.size.height) <= labelGap
+          && positiveOverlap (min start.x end.x) (max start.x end.x) label.position.x (label.position.x + label.size.width)
+
+candidates
+  :: { edge :: EdgeId, position :: Point, size :: Size }
+  -> Array Point
+  -> Array { edge :: EdgeId, position :: Point, size :: Size }
+candidates label points = A.concatMap around (A.zip points (A.drop 1 points))
+  where
+  around (start /\ end)
+    | start.x == end.x =
+        let
+          low = min start.y end.y
+          high = max start.y end.y
+          y = low + (high - low - label.size.height) / 2.0
+        in
+          if high - low < label.size.height then []
+          else
+            [ label { position = { x: start.x - labelGap - label.size.width, y } }
+            , label { position = { x: start.x + labelGap, y } }
+            ]
+    | otherwise =
+        let
+          low = min start.x end.x
+          high = max start.x end.x
+          x = low + (high - low - label.size.width) / 2.0
+        in
+          if high - low < label.size.width then []
+          else
+            [ label { position = { x, y: start.y - labelGap - label.size.height } }
+            , label { position = { x, y: start.y + labelGap } }
+            ]
+
+crosses :: forall r. { position :: Point, size :: Size | r } -> Array Point -> Boolean
+crosses label points = A.any crossesSegment (A.zip points (A.drop 1 points))
+  where
+  crossesSegment (start /\ end)
+    | start.x == end.x =
+        start.x > label.position.x
+          && start.x < label.position.x + label.size.width
+          && positiveOverlap (min start.y end.y) (max start.y end.y) label.position.y (label.position.y + label.size.height)
+    | otherwise =
+        start.y > label.position.y
+          && start.y < label.position.y + label.size.height
+          && positiveOverlap (min start.x end.x) (max start.x end.x) label.position.x (label.position.x + label.size.width)
+
+clearNode :: forall r. Size -> { position :: Point, size :: Size | r } -> Boolean
+clearNode node label =
+  label.position.x + label.size.width <= 0.0
+    || label.position.x >= node.width
+    || label.position.y + label.size.height <= 0.0
+    || label.position.y >= node.height
+
+overlaps
+  :: forall left right
+   . { position :: Point, size :: Size | left }
+  -> { position :: Point, size :: Size | right }
+  -> Boolean
+overlaps a b =
+  a.position.x < b.position.x + b.size.width
+    && a.position.x + a.size.width > b.position.x
+    && a.position.y < b.position.y + b.size.height
+    && a.position.y + a.size.height > b.position.y
+
+rangeDistance :: Number -> Number -> Number -> Number
+rangeDistance value low high
+  | value < low = low - value
+  | value > high = value - high
+  | otherwise = 0.0
+
+positiveOverlap :: Number -> Number -> Number -> Number -> Boolean
+positiveOverlap low high otherLow otherHigh = max low otherLow < min high otherHigh
 
 placeLabel :: NodePlacement -> { edge :: EdgeId, position :: Point, size :: Size } -> EdgeLabelPlacement
 placeLabel node label =

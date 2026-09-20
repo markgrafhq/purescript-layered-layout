@@ -476,13 +476,16 @@ hSegCrossesRect x1 x2 y rects = any (hLineIntersects x1 x2 y) rects
 vSegCrossesRect :: Number -> Number -> Number -> ObstacleMap -> Boolean
 vSegCrossesRect y1 y2 x rects = any (vLineIntersects y1 y2 x) rects
 
+-- | Obstacles include their required clearance. A route on an inflated
+-- | boundary is exactly at that clearance and must remain legal on either
+-- | side; only a line through the open interior is blocked.
 hLineIntersects :: Number -> Number -> Number -> FineRect -> Boolean
 hLineIntersects x1 x2 y r =
-  y >= r.y && y < r.y + r.h && x2 > r.x && x1 < r.x + r.w
+  y > r.y && y < r.y + r.h && x2 > r.x && x1 < r.x + r.w
 
 vLineIntersects :: Number -> Number -> Number -> FineRect -> Boolean
 vLineIntersects y1 y2 x r =
-  x >= r.x && x < r.x + r.w && y2 > r.y && y1 < r.y + r.h
+  x > r.x && x < r.x + r.w && y2 > r.y && y1 < r.y + r.h
 
 -- | Convert routed edge segments into obstacle rects so that
 -- subsequent edges avoid overlapping them. Width of 2 ensures

@@ -3,7 +3,7 @@ module Test.NodePlacementSpec (nodePlacementSpec) where
 import Prelude
 
 import Data.Array as A
-import Data.Foldable (foldl)
+import Data.Foldable (foldl, minimum, traverse_)
 import Data.Map as M
 import Data.Maybe (Maybe(..))
 import Data.Ord (abs)
@@ -14,6 +14,7 @@ import LayeredLayout.Compaction.EdgeAwareScanlineConstraints (scanlineConstraint
 import LayeredLayout.Compaction.HorizontalGraphCompactor as Compaction
 import LayeredLayout.Compaction.OneD as OneD
 import LayeredLayout.CoordAssignment as CoordAssignment
+import LayeredLayout.EdgeLabels as EdgeLabels
 import LayeredLayout.Graph (Edge, EdgeId(..), Label(..), NodeId(..), PortId(..), Shape(..), Side(..))
 import LayeredLayout.Grid (GridPos(..), GridSize(..), gridX, gridY, sizeH, sizeW)
 import LayeredLayout.EdgeRouting.Orthogonal as Orthogonal
@@ -240,6 +241,7 @@ nodePlacementSpec = describe "BK node placement" do
         , edges: [ edge "feedback" "b" "a" ]
         , paths: [ feedback ]
         , ports: M.empty
+        , tailLabelOwners: M.empty
         }
       endpoints = do
         path <- A.head compacted.edges
@@ -248,6 +250,23 @@ nodePlacementSpec = describe "BK node placement" do
     -- b moves from y100 to y28 while a stays at y0. `reversed`
     -- records cycle breaking, not a reversal of the canonical path.
     endpoints `shouldEqual` Just (28.0 /\ 20.0)
+
+  it "keeps an end-label reservation at its source-group offset during compaction" do
+    let
+      placement node y layer =
+        { node: NodeId node, position: GridPos (0.0 /\ y), size: GridSize (5.0 /\ 5.0), layer, order: 0 }
+      reservation = "$tail-label:edge"
+      compacted = Compaction.compactPostRouting Compaction.EdgeLength
+        { nodeNode: 12.0, edgeEdge: 10.0 }
+        Compaction.defaultBetweenLayersSpacings
+        { nodes: [ placement "source" 0.0 0, placement reservation 11.0 0, placement "target" 40.0 1 ]
+        , edges: [ edge "edge" "source" "target" ]
+        , paths: []
+        , ports: M.empty
+        , tailLabelOwners: M.singleton (NodeId reservation) (NodeId "source")
+        }
+      positions = M.fromFoldable $ compacted.nodes <#> \node -> node.node /\ gridY node.position
+    ((-) <$> M.lookup (NodeId reservation) positions <*> M.lookup (NodeId "source") positions) `shouldEqual` Just 11.0
 
   it "does not create compaction barriers from empty transverse intervals" do
     let
@@ -285,7 +304,7 @@ nodePlacementSpec = describe "BK node placement" do
         , label: Nothing
         , shape: Rectangle
         }
-      measured id w h = EdgeId id /\ GridSize (w / 4.0 /\ h / 4.0)
+      measured id w h = EdgeId id /\ { size: GridSize (w / 4.0 /\ h / 4.0), placement: EdgeLabels.Center }
       sizes = M.fromFoldable
         [ measured "backbone-5" 52.0 48.0
         , measured "backbone-9" 60.0 24.0
@@ -330,7 +349,7 @@ nodePlacementSpec = describe "BK node placement" do
             ]
         , constraints: []
         }
-      result = layout (defaultConfig { edgeLabelSizes = sizes }) graph
+      result = layout (defaultConfig { edgeLabels = sizes }) graph
       clear = do
         label <- A.find (\box -> box.edge == EdgeId "loop-8") result.edgeLabels
         route <- A.find (\path -> path.edge == EdgeId "cross-3") result.edges
@@ -339,6 +358,40 @@ nodePlacementSpec = describe "BK node placement" do
           [ { x: gridX label.position, y: gridY label.position, w: sizeW label.size, h: sizeH label.size } ]
           route.segments
     clear `shouldEqual` Just true
+
+  it "keeps fixed-port loop labels clear and closest to their own routes" do
+    let
+      owner =
+        { id: NodeId "owner"
+        , size: GridSize (80.0 /\ 40.0)
+        , ports:
+            [ { id: PortId "west", side: West, offset: 20, label: Nothing }
+            , { id: PortId "south", side: South, offset: 40, label: Nothing }
+            , { id: PortId "east", side: East, offset: 20, label: Nothing }
+            , { id: PortId "north", side: North, offset: 40, label: Nothing }
+            ]
+        , label: Nothing
+        , shape: Rectangle
+        }
+      loop id from to =
+        { id: EdgeId id
+        , from: { node: owner.id, port: Just (PortId from) }
+        , to: { node: owner.id, port: Just (PortId to) }
+        , label: Nothing
+        }
+      graph =
+        { nodes: [ owner ]
+        , edges: [ loop "l0" "west" "south", loop "l1" "south" "east", loop "l2" "east" "north", loop "l3" "north" "west" ]
+        , constraints: []
+        }
+      labels = M.fromFoldable
+        ( graph.edges <#> \loopEdge ->
+            loopEdge.id /\ { size: GridSize (32.0 /\ 12.0), placement: EdgeLabels.Center }
+        )
+      result = layout (defaultConfig { edgeLabels = labels }) graph
+      route id = A.find (\path -> path.edge == EdgeId id) result.edges
+      label id = A.find (\placement -> placement.edge == EdgeId id) result.edgeLabels
+    traverse_ (\id -> ((labelBesideOwnRoute result.edges <$> label id <*> route id) `shouldEqual` Just true)) [ "l0", "l1", "l2", "l3" ]
 
   it "includes implicit self-loop segments when compacting incident branches" do
     let
@@ -360,6 +413,7 @@ nodePlacementSpec = describe "BK node placement" do
                 ]
             ]
         , ports: M.empty
+        , tailLabelOwners: M.empty
         }
       depths = M.fromFoldable $ compacted.nodes <#> \n -> n.node /\ (4.0 * gridY n.position)
     -- The fractional loop port reserves one additional fine unit.
@@ -422,7 +476,40 @@ groupedLoopClearances offset = do
             ]
         ]
     , ports: M.empty
+    , tailLabelOwners: M.empty
     }
+
+labelBesideOwnRoute :: Array Result.EdgePath -> Result.EdgeLabelPlacement -> Result.EdgePath -> Boolean
+labelBesideOwnRoute paths label path =
+  case minimum (A.mapMaybe projectedGap path.segments), minimum (map distanceSquared (A.concatMap _.segments paths)) of
+    Just ownGap, Just nearest -> ownGap > 0.0 && abs (ownGap * ownGap - nearest) < 0.000001
+    _, _ -> false
+  where
+  left = gridX label.position
+  right = left + sizeW label.size
+  top = gridY label.position
+  bottom = top + sizeH label.size
+  projectedGap segment
+    | segment.direction == Result.V && positiveProjection (min (gridY segment.start) (gridY segment.end)) (max (gridY segment.start) (gridY segment.end)) top bottom =
+        Just (rangeDistance (gridX segment.start) left right)
+    | segment.direction == Result.H && positiveProjection (min (gridX segment.start) (gridX segment.end)) (max (gridX segment.start) (gridX segment.end)) left right =
+        Just (rangeDistance (gridY segment.start) top bottom)
+    | otherwise = Nothing
+  distanceSquared segment =
+    let
+      dx = max 0.0 (max (min (gridX segment.start) (gridX segment.end) - right) (left - max (gridX segment.start) (gridX segment.end)))
+      dy = max 0.0 (max (min (gridY segment.start) (gridY segment.end) - bottom) (top - max (gridY segment.start) (gridY segment.end)))
+    in
+      dx * dx + dy * dy
+
+rangeDistance :: Number -> Number -> Number -> Number
+rangeDistance value low high
+  | value < low = low - value
+  | value > high = value - high
+  | otherwise = 0.0
+
+positiveProjection :: Number -> Number -> Number -> Number -> Boolean
+positiveProjection low high otherLow otherHigh = max low otherLow < min high otherHigh
 
 type Connection = { from :: String, to :: String, source :: Number, target :: Number }
 
