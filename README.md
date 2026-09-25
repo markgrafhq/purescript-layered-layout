@@ -115,6 +115,77 @@ Multiply coarse coordinates by `scaleFactor` to render everything in the same
 space. Measured labels reserve layout space; setting an edge's text `label`
 alone does not measure or reserve that space.
 
+### Measuring content-sized nodes
+
+The layout engine does not render React components or measure text. Supply the
+size of each **rendered node box**, including padding and borders—not just the
+text width.
+
+For React Flow, use this sequence:
+
+1. Render the nodes with content-driven CSS and no fixed `width`/`height`.
+   The example uses `width: max-content; max-width: 220px`, so long content wraps.
+2. Inside a `ReactFlowProvider`, wait for
+   [`useNodesInitialized()`](https://reactflow.dev/api-reference/hooks/use-nodes-initialized).
+   React Flow's resize observer populates
+   [`node.measured.width` and `node.measured.height`](https://reactflow.dev/api-reference/types/node)
+   in unzoomed CSS pixels.
+3. Convert those dimensions to coarse units and call `layout()`. Missing
+   measurements mean “wait”, not “substitute a default rectangle”:
+
+```ts
+import { layout, type Graph, type LayoutResult } from "@markgrafhq/layered-layout";
+import type { Node as FlowNode } from "@xyflow/react";
+
+// An application-chosen scale, not a requirement of the engine.
+const COARSE_PX = 12;
+
+function layoutMeasuredNodes(
+  nodes: readonly FlowNode[],
+  edges: Graph["edges"],
+): LayoutResult | null {
+  const inputNodes: Array<Graph["nodes"][number]> = [];
+  for (const node of nodes) {
+    const { width, height } = node.measured ?? {};
+    if (width === undefined || height === undefined || width <= 0 || height <= 0) {
+      return null;
+    }
+    inputNodes.push({
+      id: node.id,
+      size: [width / COARSE_PX, height / COARSE_PX],
+    });
+  }
+  return layout({ nodes: inputNodes, edges });
+}
+```
+
+4. Multiply returned node positions by `COARSE_PX` and route/label coordinates
+   by `COARSE_PX / scaleFactor`. Update positions and routes, but preserve node
+   data and measurements. **Do not write layout sizes back into the
+   content-driven CSS**; that can prevent shrinking or cause a resize loop.
+5. Rerun when measured dimensions, graph connections, or layout options change.
+   `useNodesInitialized()` gates initial readiness; it is not a subscription to
+   every subsequent resize. The example uses `useStore` with an equality
+   function comparing only node IDs and measured dimensions, so changing
+   positions does not trigger layout again. Content edits and font/CSS changes
+   that resize nodes do.
+
+Keep fractional coarse sizes: a measured width of 135 px becomes `11.25`
+coarse units at this scale. Do not round every node to a whole grid cell.
+Do not multiply by `devicePixelRatio` or use a zoomed `getBoundingClientRect()`
+as the layout size.
+
+To hide the initial pile of unpositioned nodes, use `opacity: 0` and reveal them
+after layout. `display: none` and React Flow's `hidden` flag prevent the
+measurement needed to proceed. For custom renderers, a `ResizeObserver`
+border-box measurement provides the corresponding DOM measurement; for web
+fonts, wait for `document.fonts.ready` or rerun when loading changes dimensions.
+
+Node measurement does not measure edge labels. Measure each dynamic label's
+box with its actual font, wrapping, padding, and borders, then pass
+`size: [labelWidthPx / COARSE_PX, labelHeightPx / COARSE_PX]` in `edgeLabels`.
+The example's two edge labels have explicitly sized boxes.
+
 ### React Flow example
 
 [`examples/react-flow`](examples/react-flow) is a standalone React + TypeScript
@@ -128,9 +199,11 @@ npm run dev
 ```
 
 `npm run build` runs strict TypeScript checking and creates a production bundle.
-The example converts both coordinate systems to pixels, renders the engine's
-orthogonal routes through a custom React Flow edge, and displays measured edge
-labels. Toggle the feedback edge or change node spacing to recompute the layout.
+The example measures content-sized nodes, converts both coordinate systems to
+pixels, renders the engine's orthogonal routes through a custom React Flow
+edge, and displays measured edge labels. Toggle **Longer node content** to see
+the service node grow, wrap, and automatically reroute its edges; toggle it off
+to shrink again. The feedback-edge and spacing controls also recompute layout.
 Pan and zoom are enabled; node dragging is disabled so it cannot detach the
 engine-owned routes from their endpoints.
 

@@ -6,6 +6,10 @@
 
 - Run a standalone TypeScript React Flow example with orthogonal routes, measured labels, feedback edges, and adjustable spacing.
 
+### Changed
+
+- The React Flow example now measures content-sized nodes and automatically relayouts after resizing, with a guide to pixel/grid conversion and avoiding measurement loops.
+
 ## 0.0.1 - 2026-09-25
 
 ### Added
