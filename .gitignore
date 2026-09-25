@@ -4,3 +4,5 @@ output-es/
 node_modules/
 .purs-repl
 .psc-ide-port
+dist/
+*.tgz

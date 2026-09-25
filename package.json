@@ -1,7 +1,54 @@
 {
-  "name": "purescript-layered-layout",
+  "name": "@markgrafhq/layered-layout",
+  "version": "0.0.1",
+  "description": "ELK-style layered graph layout with orthogonal routing, ports, constraints, and measured edge labels",
+  "license": "MIT AND EPL-2.0",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "CHANGELOG.md",
+    "LICENSE",
+    "LICENSE-EPL-2.0"
+  ],
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/markgrafhq/purescript-layered-layout.git"
+  },
+  "homepage": "https://github.com/markgrafhq/purescript-layered-layout#readme",
+  "bugs": "https://github.com/markgrafhq/purescript-layered-layout/issues",
+  "keywords": ["graph", "layout", "layered", "elk", "typescript", "purescript"],
   "scripts": {
-    "build": "spago build",
-    "test": "spago test"
+    "build": "spago build && node scripts/build.mjs",
+    "test": "spago test",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "purescript": "0.15.16",
+    "purs-tidy": "0.11.0",
+    "spago": "1.0.4",
+    "typescript": "7.0.2"
   }
 }
