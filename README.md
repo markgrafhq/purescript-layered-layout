@@ -115,6 +115,25 @@ Multiply coarse coordinates by `scaleFactor` to render everything in the same
 space. Measured labels reserve layout space; setting an edge's text `label`
 alone does not measure or reserve that space.
 
+### React Flow example
+
+[`examples/react-flow`](examples/react-flow) is a standalone React + TypeScript
+app that installs the published npm package, without workspace aliases or
+PureScript tooling:
+
+```sh
+cd examples/react-flow
+npm ci
+npm run dev
+```
+
+`npm run build` runs strict TypeScript checking and creates a production bundle.
+The example converts both coordinate systems to pixels, renders the engine's
+orthogonal routes through a custom React Flow edge, and displays measured edge
+labels. Toggle the feedback edge or change node spacing to recompute the layout.
+Pan and zoom are enabled; node dragging is disabled so it cannot detach the
+engine-owned routes from their endpoints.
+
 ## Building from source
 
 ```sh

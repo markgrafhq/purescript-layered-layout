@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Run a standalone TypeScript React Flow example with orthogonal routes, measured labels, feedback edges, and adjustable spacing.
+
 ## 0.0.1 - 2026-09-25
 
 ### Added
