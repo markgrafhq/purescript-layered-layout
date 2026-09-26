@@ -7,7 +7,7 @@ workspace:
 package:
   name: layered-layout
   publish:
-    version: 0.0.3
+    version: 0.0.4
     license: MIT AND EPL-2.0
     location:
       githubOwner: markgrafhq

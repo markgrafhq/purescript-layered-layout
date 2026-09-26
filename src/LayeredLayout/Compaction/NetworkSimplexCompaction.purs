@@ -168,7 +168,9 @@ placeEdge hooks st cNode incNode cg incCg s = do
       + cNode.hitbox.width
       + spacing
       - incNode.cGroupOffset.x
-  let delta = max 0 (Int.ceil (rawDelta))
+  -- Members of rigid groups may interleave. Their masters need a signed
+  -- separation; clamping it can turn a feasible cycle into an impossible one.
+  let delta = Int.ceil rawDelta
   -- Upstream defect correction: helper pairs can reverse regular bend
   -- segments, invalidating the scanline's transitive obstacle ordering.
   -- The actual ELK scanline and simplex reproduce CENTER crossings on

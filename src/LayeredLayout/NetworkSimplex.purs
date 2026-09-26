@@ -81,6 +81,9 @@ infInt = 1000000000
 
 -- | Run the network simplex over the given nodes and edges.
 -- |
+-- | Difference bounds must be feasible: directed cycles may have zero or
+-- | negative total delta, never positive. Individual deltas may be negative.
+-- |
 -- | The caller is responsible for ensuring the input is weakly-
 -- | connected (split into components, or inject an artificial root
 -- | that dominates all sources). When the input is disconnected the
@@ -214,10 +217,12 @@ layeringTopological nodes edges st0 = do
   let initIncident = nodes <#> \n -> n /\ A.length (fromMaybe [] (M.lookup n incoming))
   let incidentMap0 = M.fromFoldable initIncident
   let sources = A.filter (\n -> fromMaybe 0 (M.lookup n incidentMap0) == 0) nodes
-  go outgoing incidentMap0 sources st0
+  go outgoing incidentMap0 sources (A.length nodes) st0
   where
-  go outs incident queue st = case A.uncons queue of
-    Nothing -> st
+  go outs incident queue remaining st = case A.uncons queue of
+    Nothing ->
+      if remaining == 0 then st
+      else layeringCyclic (A.length nodes) edges st
     Just { head: n, tail: rest } -> do
       let myOuts = fromMaybe [] (M.lookup n outs)
       let layN = layerOf st n
@@ -233,7 +238,31 @@ layeringTopological nodes edges st0 = do
           )
           { st, incident, queue: rest }
           myOuts
-      go outs incident' queue' st'
+      go outs incident' queue' (remaining - 1) st'
+
+-- Kahn's linear-time path covers layer assignment and acyclic compaction.
+-- Interleaved rigid groups can instead form feasible signed cycles. Complete
+-- their difference bounds with longest-path relaxation before building a tight
+-- tree. Feasibility bounds a longest simple path to fewer than |V| edges.
+layeringCyclic :: forall n. Ord n => Int -> Array (NEdge n) -> NSState n -> NSState n
+layeringCyclic remaining edges st
+  | remaining <= 0 = st
+  | otherwise =
+      let
+        relaxed = foldl relax { st, changed: false } edges
+      in
+        if relaxed.changed then layeringCyclic (remaining - 1) edges relaxed.st
+        else relaxed.st
+      where
+      relax acc edge =
+        let
+          required = layerOf acc.st edge.src + edge.delta
+        in
+          if required <= layerOf acc.st edge.tgt then acc
+          else
+            { st: acc.st { layer = M.insert edge.tgt required acc.st.layer }
+            , changed: true
+            }
 
 -- ── feasibleTree ───────────────────────────────────────────────────
 

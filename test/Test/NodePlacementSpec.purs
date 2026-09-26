@@ -10,6 +10,7 @@ import Data.Ord (abs)
 import Data.Set as S
 import Data.Tuple.Nested (type (/\), (/\))
 import LayeredLayout (defaultConfig, layout)
+import LayeredLayout.Aesthetics (nodeOverlapCount)
 import LayeredLayout.Compaction.EdgeAwareScanlineConstraints (scanlineConstraints)
 import LayeredLayout.Compaction.HorizontalGraphCompactor as Compaction
 import LayeredLayout.Compaction.OneD as OneD
@@ -19,6 +20,7 @@ import LayeredLayout.Graph (Edge, EdgeId(..), Label(..), NodeId(..), PortId(..),
 import LayeredLayout.Grid (GridPos(..), GridSize(..), gridX, gridY, sizeH, sizeW)
 import LayeredLayout.EdgeRouting.Orthogonal as Orthogonal
 import LayeredLayout.Result as Result
+import LayeredLayout.NetworkSimplex (runNetworkSimplex)
 import LayeredLayout.JavaRandom (mkRandom)
 import Test.Spec (Spec, describe, it)
 import Test.Spec.Assertions (shouldEqual, shouldSatisfy)
@@ -267,6 +269,57 @@ nodePlacementSpec = describe "BK node placement" do
         }
       positions = M.fromFoldable $ compacted.nodes <#> \node -> node.node /\ gridY node.position
     ((-) <$> M.lookup (NodeId reservation) positions <*> M.lookup (NodeId "source") positions) `shouldEqual` Just 11.0
+
+  it "keeps routed branches separated when source captions interleave with their bends" do
+    let
+      placement name x y w h layer =
+        { node: NodeId name, position: GridPos (x /\ y), size: GridSize (w /\ h), layer, order: 0 }
+      route name points =
+        { edge: EdgeId name
+        , segments: A.zipWith
+            (\start end -> { start, end, direction: if gridX start == gridX end then Result.V else Result.H })
+            points
+            (A.drop 1 points)
+        , bends: A.dropEnd 1 (A.drop 1 points)
+        , bendType: []
+        , jumps: []
+        , reversed: false
+        }
+      compacted = Compaction.compactPostRouting Compaction.EdgeLength
+        { nodeNode: 12.0, edgeEdge: 10.0 }
+        Compaction.defaultBetweenLayersSpacings
+        { nodes:
+            [ placement "source" 1.5 1.0 2.5 1.0 0
+            , placement "left" 1.25 6.5 2.0 1.5 1
+            , placement "right" 6.25 6.5 2.0 1.5 1
+            , placement "$tail-label:left" 0.0 3.0 1.75 0.5 0
+            , placement "$tail-label:right" 1.0 4.0 1.5 0.5 0
+            ]
+        , edges: [ edge "left" "source" "left", edge "right" "source" "right" ]
+        , paths:
+            [ route "left" (map GridPos [ 9.5 /\ 8.0, 9.5 /\ 13.0, 16.5 /\ 13.0, 16.5 /\ 20.0, 9.5 /\ 20.0, 9.5 /\ 26.0 ])
+            , route "right" (map GridPos [ 12.5 /\ 8.0, 12.5 /\ 22.0, 28.0 /\ 22.0, 28.0 /\ 26.0 ])
+            ]
+        , ports: M.empty
+        , tailLabelOwners: M.fromFoldable
+            [ NodeId "$tail-label:left" /\ NodeId "source"
+            , NodeId "$tail-label:right" /\ NodeId "source"
+            ]
+        }
+    nodeOverlapCount compacted.nodes `shouldEqual` 0
+
+  it "preserves signed cyclic bounds when reattaching pruned leaves" do
+    let
+      bounds =
+        [ { src: 0, tgt: 1, delta: 4, weight: 1.0, eid: 0 }
+        , { src: 1, tgt: 0, delta: -4, weight: 1.0, eid: 1 }
+        , { src: 1, tgt: 2, delta: 6, weight: 1.0, eid: 2 }
+        , { src: 2, tgt: 0, delta: -12, weight: 1.0, eid: 3 }
+        ] <> (A.range 3 42 <#> \leaf -> { src: 2, tgt: leaf, delta: -13, weight: 1.0, eid: leaf + 1 })
+      layers = runNetworkSimplex (A.range 0 42) bounds
+    traverse_
+      (\bound -> ((_ >= bound.delta) <$> ((-) <$> M.lookup bound.tgt layers <*> M.lookup bound.src layers)) `shouldEqual` Just true)
+      bounds
 
   it "does not create compaction barriers from empty transverse intervals" do
     let
