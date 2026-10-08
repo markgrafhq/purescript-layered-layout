@@ -63,6 +63,7 @@ data Shape
   | Ellipse
   | Document
   | Cloud
+  | Queue
 
 derive instance Eq Shape
 derive instance Ord Shape
@@ -76,6 +77,7 @@ instance Show Shape where
   show Ellipse = "Ellipse"
   show Document = "Document"
   show Cloud = "Cloud"
+  show Queue = "Queue"
 
 instance ReadForeign Shape where
   readImpl = readEnum
@@ -127,6 +129,7 @@ parseShape s = case s of
   "document" -> Just Document
   "doc" -> Just Document
   "cloud" -> Just Cloud
+  "queue" -> Just Queue
   _ -> Nothing
 
 -- | Inverse of `parseShape`. Used when serializing a Node back to a Document.
@@ -139,6 +142,7 @@ shapeName = case _ of
   Ellipse -> "ellipse"
   Document -> "document"
   Cloud -> "cloud"
+  Queue -> "queue"
 
 -- | A displayable text label attached to a token, node, or edge.
 -- | Distinct from node/edge ids so the type system catches accidental
