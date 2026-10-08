@@ -9,7 +9,8 @@ export type Shape =
   | "Diamond"
   | "Ellipse"
   | "Document"
-  | "Cloud";
+  | "Cloud"
+  | "Queue";
 
 export interface Port {
   readonly id: string;
