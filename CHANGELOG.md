@@ -5,7 +5,7 @@
 ### Added
 
 - Run a standalone TypeScript React Flow example with orthogonal routes, measured labels, feedback edges, and adjustable spacing.
-- Recognize the `queue` node shape for horizontal-cylinder renderers.
+- Recognize the `drum` node shape for horizontal-cylinder renderers.
 
 ### Changed
 
