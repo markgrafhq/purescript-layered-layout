@@ -116,13 +116,14 @@ cloudHatRatio = 0.38
 documentWaveDrop :: Number
 documentWaveDrop = 0.05
 
--- | Parse a user-facing shape name (case-insensitive) from `+node id {shape: cylinder}`.
+-- | Parse a user-facing shape name, including shorthand and semantic aliases.
 parseShape :: String -> Maybe Shape
 parseShape s = case s of
   "rectangle" -> Just Rectangle
   "rect" -> Just Rectangle
   "cylinder" -> Just Cylinder
   "cyl" -> Just Cylinder
+  "database" -> Just Cylinder
   "parallelogram" -> Just Parallelogram
   "diamond" -> Just Diamond
   "ellipse" -> Just Ellipse
@@ -130,6 +131,7 @@ parseShape s = case s of
   "doc" -> Just Document
   "cloud" -> Just Cloud
   "drum" -> Just Drum
+  "queue" -> Just Drum
   _ -> Nothing
 
 -- | Inverse of `parseShape`. Used when serializing a Node back to a Document.

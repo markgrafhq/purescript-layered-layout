@@ -6,6 +6,7 @@
 
 - Run a standalone TypeScript React Flow example with orthogonal routes, measured labels, feedback edges, and adjustable spacing.
 - Recognize the `drum` node shape for horizontal-cylinder renderers.
+- Accept `queue` and `database` as aliases for `drum` and `cylinder`.
 
 ### Changed
 
